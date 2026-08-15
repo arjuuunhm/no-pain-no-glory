@@ -47,7 +47,7 @@ from nflforecast.features.opportunity import build_opportunity_features
 from nflforecast.features.priors import build_prior_features
 from nflforecast.features.redzone import build_redzone_features
 from nflforecast.features.scheme import build_scheme_features
-from nflforecast.features.spine import build_spine
+from nflforecast.features.spine import build_preseason_spine, build_spine
 from nflforecast.features.utils import attach_asof
 from nflforecast.features.vegas import build_vegas_features
 
@@ -56,6 +56,7 @@ logger = get_logger(__name__)
 FEATURES_PATH = PROCESSED_DIR / "player_week_features.parquet"
 WEEKLY_LABELS_PATH = PROCESSED_DIR / "player_week_labels.parquet"
 SEASON_LABELS_PATH = PROCESSED_DIR / "player_season_labels.parquet"
+PRESEASON_FEATURES_PATH = PROCESSED_DIR / "preseason_features.parquet"
 
 
 def build_feature_table(
@@ -63,7 +64,20 @@ def build_feature_table(
     features_path: Path = FEATURES_PATH,
     weekly_labels_path: Path = WEEKLY_LABELS_PATH,
     season_labels_path: Path = SEASON_LABELS_PATH,
+    upcoming_season: int | None = None,
+    preseason_features_path: Path = PRESEASON_FEATURES_PATH,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Build the feature table, optionally including an unplayed season.
+
+    `upcoming_season` appends `spine.build_preseason_spine` rows for a season
+    that has not started, runs them through the identical block joins, and
+    writes them to their **own** file. Separate rather than appended, for one
+    reason: the label tables are built from the real spine only, and a row
+    with no season yet played would otherwise land in the panel as a genuine
+    zero-point season (`panel.build_panel` fills missing actuals with 0) and
+    be trained on. The split is what keeps that impossible rather than
+    merely unlikely.
+    """
     logger.info("Loading raw tables from %s", raw_dir)
     weekly_stats = pl.read_parquet(raw_dir / "weekly_player_stats.parquet")
     snap_counts = pl.read_parquet(raw_dir / "snap_counts.parquet")
@@ -78,6 +92,20 @@ def build_feature_table(
     spine = build_spine(rosters_weekly, snap_counts, players)
     logger.info("Spine: %s player-weeks, %s played", spine.height, spine["played"].sum())
 
+    # Labels are built from `spine` alone, below. `feature_spine` is what the
+    # feature blocks attach to, and is the only one the upcoming season joins.
+    feature_spine = spine
+    if upcoming_season is not None:
+        rosters = pl.read_parquet(raw_dir / "rosters.parquet")
+        preseason = build_preseason_spine(rosters, upcoming_season)
+        if preseason.height == 0:
+            raise ValueError(
+                f"no {upcoming_season} rosters in {raw_dir / 'rosters.parquet'} -- "
+                f"pull it first (build_dataset.py --end {upcoming_season})"
+            )
+        logger.info("Preseason spine: %s players for %s", preseason.height, upcoming_season)
+        feature_spine = pl.concat([spine, preseason], how="vertical_relaxed")
+
     logger.info("Building opportunity features")
     opportunity = build_opportunity_features(weekly_stats, snap_counts, players)
 
@@ -87,23 +115,45 @@ def build_feature_table(
     logger.info("Building game-script features")
     game_script = build_game_script_features(pbp)
 
+    # Team-grain blocks emit rows only where games exist, so the upcoming
+    # season needs a placeholder team-week to carry the prior season's
+    # trailing windows across the boundary. See `utils.append_upcoming_week`.
     logger.info("Building O-line features")
-    oline = build_oline_features(pbp)
+    oline = build_oline_features(pbp, upcoming_season=upcoming_season)
 
     logger.info("Building scheme / play-caller features")
-    scheme = build_scheme_features(pbp, schedules)
+    scheme = build_scheme_features(pbp, schedules, upcoming_season=upcoming_season)
 
     logger.info("Building Vegas context")
     vegas = build_vegas_features(schedules)
 
     logger.info("Building priors, availability history, injury reports")
-    priors = build_prior_features(rosters_weekly, players).drop("position")
-    prior_avail = build_prior_season_availability(spine)
-    participation = build_participation_history(spine)
+    # `build_prior_features` reads only (gsis_id, season, years_exp) from this
+    # frame and takes age/draft capital from `players`. The upcoming season has
+    # no weekly rosters, so its experience counts come from the seasonal file --
+    # without this, age and draft capital are null for every preseason row, and
+    # they are precisely what a projection leans on for young players.
+    prior_source = rosters_weekly.select(["gsis_id", "season", "years_exp"])
+    if upcoming_season is not None:
+        prior_source = pl.concat(
+            [
+                prior_source,
+                rosters.filter(pl.col("season") == upcoming_season).select(
+                    ["gsis_id", "season", "years_exp"]
+                ),
+            ],
+            how="vertical_relaxed",
+        )
+    priors = build_prior_features(prior_source, players).drop("position")
+    # Availability history is derived from the spine's own play record, so it
+    # is built on `feature_spine`: the upcoming season's rows carry no plays
+    # of their own but must still see the seasons behind them.
+    prior_avail = build_prior_season_availability(feature_spine)
+    participation = build_participation_history(feature_spine)
     injury_report = build_injury_report_features(injuries, depth_charts)
 
     logger.info("Joining feature blocks onto the spine")
-    df = spine.drop("offense_snaps")
+    df = feature_spine.drop("offense_snaps")
 
     # Player-grain rolling blocks: strictly-prior as-of attach.
     for name, block in (("opportunity", opportunity), ("redzone", redzone), ("game_script", game_script)):
@@ -126,9 +176,23 @@ def build_feature_table(
     # `played` is the availability *label*; it belongs in the label table only.
     df = df.drop("played")
 
+    # Labels from the real spine only: the upcoming season has no outcomes,
+    # and a zero-filled row for it would be indistinguishable from a rostered
+    # player who genuinely never scored.
     logger.info("Building label tables")
     weekly_labels = build_weekly_labels(spine, weekly_stats)
     season_labels = build_season_labels(spine, weekly_labels)
+
+    if upcoming_season is not None:
+        preseason_features = df.filter(pl.col("season") == upcoming_season)
+        df = df.filter(pl.col("season") != upcoming_season)
+        preseason_features.write_parquet(preseason_features_path)
+        logger.info(
+            "preseason    %6s rows x %3s cols -> %s",
+            preseason_features.height,
+            preseason_features.width,
+            preseason_features_path,
+        )
 
     df.write_parquet(features_path)
     weekly_labels.write_parquet(weekly_labels_path)

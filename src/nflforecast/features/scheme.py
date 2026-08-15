@@ -54,7 +54,7 @@ from __future__ import annotations
 import polars as pl
 
 from nflforecast.config import MANUAL_DIR, ROLLING_WINDOWS, get_logger, normalize_team
-from nflforecast.features.utils import add_trailing_rolling
+from nflforecast.features.utils import add_trailing_rolling, append_upcoming_week
 
 logger = get_logger(__name__)
 
@@ -182,22 +182,30 @@ def build_play_caller_features(schedules: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def build_scheme_features(pbp: pl.DataFrame, schedules: pl.DataFrame) -> pl.DataFrame:
+def build_scheme_features(
+    pbp: pl.DataFrame, schedules: pl.DataFrame, upcoming_season: int | None = None
+) -> pl.DataFrame:
     """Team-week scheme features: rolled in-season form + prior-season track record."""
     weekly = _team_week_tendencies(pbp).sort(["team", "season", "week"])
-
-    rolled = add_trailing_rolling(
-        weekly, group_col="team", order_cols=["season", "week"],
-        value_cols=TENDENCY_COLS, windows=list(ROLLING_WINDOWS),
-    )
 
     # Prior-season track record: aggregate the team's completed season, then
     # attach it to the *following* season. Uses a season+1 join key rather than
     # shift() so a team missing from a season cannot silently misalign.
+    # Computed before any placeholder is appended, so it aggregates played
+    # games only -- and the season+1 key already produces the upcoming
+    # season's row from the season just completed.
     season_level = (
         weekly.group_by(["team", "season"])
         .agg([pl.col(c).mean().alias(f"prev_season_{c}") for c in TENDENCY_COLS])
         .with_columns((pl.col("season") + 1).alias("season"))
+    )
+
+    if upcoming_season is not None:
+        weekly = append_upcoming_week(weekly, "team", upcoming_season)
+
+    rolled = add_trailing_rolling(
+        weekly, group_col="team", order_cols=["season", "week"],
+        value_cols=TENDENCY_COLS, windows=list(ROLLING_WINDOWS),
     )
 
     df = rolled.drop(TENDENCY_COLS).join(season_level, on=["team", "season"], how="left")

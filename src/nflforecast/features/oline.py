@@ -56,7 +56,7 @@ from __future__ import annotations
 import polars as pl
 
 from nflforecast.config import ROLLING_WINDOWS, normalize_team
-from nflforecast.features.utils import add_trailing_rolling
+from nflforecast.features.utils import add_trailing_rolling, append_upcoming_week
 
 # Football Outsiders Adjusted Line Yards banding.
 STUFF_MULTIPLIER = 1.2
@@ -84,7 +84,7 @@ def _line_yard_credit() -> pl.Expr:
     )
 
 
-def build_oline_features(pbp: pl.DataFrame) -> pl.DataFrame:
+def build_oline_features(pbp: pl.DataFrame, upcoming_season: int | None = None) -> pl.DataFrame:
     reg = pbp.filter((pl.col("season_type") == "REG") & pl.col("posteam").is_not_null()).with_columns(
         normalize_team("posteam")
     )
@@ -126,6 +126,9 @@ def build_oline_features(pbp: pl.DataFrame) -> pl.DataFrame:
         .rename({"posteam": "team"})
         .sort(["team", "season", "week"])
     )
+
+    if upcoming_season is not None:
+        df = append_upcoming_week(df, "team", upcoming_season)
 
     df = add_trailing_rolling(
         df, group_col="team", order_cols=["season", "week"],
