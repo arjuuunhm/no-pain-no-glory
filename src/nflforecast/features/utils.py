@@ -59,6 +59,34 @@ def add_trailing_rolling(
     return df.with_columns(exprs)
 
 
+def append_upcoming_week(
+    df: pl.DataFrame,
+    group_col: str,
+    season: int,
+    week: int = 1,
+) -> pl.DataFrame:
+    """One value-less row per group for a season that has not been played.
+
+    Team-grain blocks emit a row only where games exist, so a season that has
+    not started has no `(team, season, week)` key and every team feature
+    joins to null. Appending a placeholder row *before* `add_trailing_rolling`
+    fixes that exactly, rather than approximately: the roll is shift(1)-then-
+    rolling and does not reset at season boundaries, so the placeholder
+    receives the trailing window over the end of the previous season -- which
+    is precisely what a real week-1 row receives.
+
+    The placeholder's own value columns are null, which is correct: those
+    describe the game being predicted, and every caller drops them.
+    """
+    placeholder = df.select(group_col).unique().with_columns(
+        pl.lit(season).cast(df.schema["season"]).alias("season"),
+        pl.lit(week).cast(df.schema["week"]).alias("week"),
+    )
+    return pl.concat([df, placeholder], how="diagonal_relaxed").sort(
+        [group_col, "season", "week"]
+    )
+
+
 def add_inclusive_rolling(
     df: pl.DataFrame,
     group_col: str,

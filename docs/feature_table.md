@@ -14,17 +14,26 @@ K/DST are a different problem.
 Requires `data/raw/*.parquet` to exist first (`scripts/build_dataset.py`).
 
 ```bash
-python scripts/build_features.py     # build
-python scripts/validate_features.py  # assert leakage-free + sane
+python scripts/build_features.py                        # build
+python scripts/build_features.py --upcoming-season 2026 # + an unplayed season
+python scripts/validate_features.py                     # assert leakage-free + sane
 ```
 
-Verified end-to-end against the 2016-2024 raw pull:
+Verified end-to-end against the 2016-2025 raw pull:
 
 | File | Rows | Cols | Grain |
 |---|---:|---:|---|
-| `player_week_features.parquet` | 76,385 | 161 | `(player_id, season, week)` |
-| `player_week_labels.parquet` | 76,385 | 18 | `(player_id, season, week)` |
-| `player_season_labels.parquet` | 5,812 | 10 | `(player_id, season)` |
+| `player_week_features.parquet` | 85,117 | 161 | `(player_id, season, week)` |
+| `player_week_labels.parquet` | 85,117 | 18 | `(player_id, season, week)` |
+| `player_season_labels.parquet` | 6,431 | 10 | `(player_id, season)` |
+| `preseason_features.parquet` | 788 | 161 | `(player_id, season)`, week 1 only |
+
+`preseason_features.parquet` appears only with `--upcoming-season`. It is the
+same 161 columns for a season that has not been played, built off the seasonal
+roster file because no weekly roster exists yet, and written **separately** —
+it must never reach the label tables, because `model/panel.py` fills a missing
+outcome with zero and would train on an unplayed season as a real zero-point
+one. See `docs/features.md` §7, "Projecting a season that hasn't started".
 
 Features and labels are **separate files on a shared key**. That split is the
 enforcement mechanism for the leakage rules below: a raw current-week number
@@ -35,7 +44,7 @@ reads.
 
 Everything hangs off `spine.py`: one row per rostered RB/WR/TE per
 regular-season week, from `load_rosters_weekly()` — **not** from whoever
-recorded a stat line. 76,385 player-weeks, 51,403 of them played (67%).
+recorded a stat line. 85,117 player-weeks, 57,306 of them played (67%).
 
 This is what makes availability modellable. Keyed off weekly stats, a player
 who missed week 7 had no week-7 row at all, so the availability model had no

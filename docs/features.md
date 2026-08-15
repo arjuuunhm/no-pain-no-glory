@@ -294,7 +294,8 @@ baseline on acquiring paid data.
   your projection's cutoff time, not the closing line, or you'll overstate real-world usable accuracy.
 - **End-of-season roster/depth-chart fields** in `load_rosters()` (non-weekly) reflect final-season status,
   not the roster as it stood at each week — use `load_rosters_weekly()` for anything used as a per-week
-  feature.
+  feature. The one deliberate exception is a season that has not been played, where no weekly roster
+  exists at all (see "Projecting a season that hasn't started" below).
 
 **Sample-size / small-n bias**
 - **Efficiency ratios (RACR, PACR, YPC, TD rate) are mechanically noisier for low-volume players** — a
@@ -312,6 +313,46 @@ baseline on acquiring paid data.
 - **Combine/athletic-testing outliers**: small numbers of combine reps per position per class mean extreme
   percentile claims (e.g. "99th percentile burst score") are themselves noisy; don't treat combine
   percentiles as more precise than they are.
+
+**Projecting a season that hasn't started**
+
+Everything above assumes the season being predicted has rows. A *draft-day*
+projection for an upcoming season does not, and the gap is structural rather
+than a matter of waiting for data:
+
+- **`load_rosters_weekly()` has no upcoming season and will not fake one** — it
+  raises `ValueError: Season must be between 2002 and 2025` when asked for 2026.
+  The seasonal `load_rosters()` *does* carry it, uses the same `status`
+  vocabulary, and is therefore the only available spine. This is the exception
+  to the leakage bullet above: the objection to seasonal rosters is that they
+  describe end-of-season status, which is irrelevant for a season with no
+  status to be end-of yet.
+- **Team-grain blocks emit no row for a season with no games**, so every team
+  feature joins to null — silently, since a left join on a missing key is not
+  an error. `utils.append_upcoming_week` adds a placeholder team-week *before*
+  the rolling step; because the roll is shift(1)-then-rolling and deliberately
+  does **not** reset at season boundaries (§7's Marcel-style continuity), the
+  placeholder receives the trailing window over the end of the prior season —
+  which is exactly what a real week-1 row receives, not an approximation.
+- **Age and draft capital come from a different source than experience.**
+  `build_prior_features` reads `years_exp` from whichever roster frame it is
+  handed and the rest from `load_players()`; hand it the weekly file alone and
+  every upcoming-season row loses age and draft capital, which are precisely
+  the features a projection leans on for young players.
+- **The output must not reach the label tables.** A row for an unplayed season
+  has no outcome, and `model/panel.py` fills a missing outcome with zero — so
+  an unplayed season quietly becomes a real zero-point season to train on.
+  `preseason_features.parquet` is a separate file for that reason.
+- **The failure mode throughout is silence, not exceptions.** Two of these bit
+  during implementation (an unnormalised `AZ` abbreviation, and experience read
+  from the wrong frame) and neither raised anything — the projection ran and
+  produced plausible-looking numbers with an all-null column behind them.
+  `scripts/validate_projections.py` compares preseason feature coverage against
+  a real week-1 row for this reason.
+
+See `docs/modeling.md`, "Projecting a season that has not been played", for the
+end-to-end command sequence and what a projection built before the late-August
+cut deadline is actually worth.
 
 **Redundancy**
 - **WOPR is a linear combination of `target_share` and `air_yards_share`** — including all three as

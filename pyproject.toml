@@ -7,6 +7,12 @@ dependencies = [
     "nflreadpy>=0.1.5",
     "polars>=1.0",
     "pyarrow>=15.0",
+    # The modelling layer only. `lightgbm` is the boosting library resources.md
+    # §4 picks over XGBoost for small tabular data; `numpy` comes with it and is
+    # used only to hand LightGBM a design matrix. The pipeline and the benchmark
+    # ladder stay pure polars.
+    "lightgbm>=4.0",
+    "numpy>=1.24",
 ]
 
 [tool.setuptools.packages.find]

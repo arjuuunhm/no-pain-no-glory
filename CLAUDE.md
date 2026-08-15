@@ -12,12 +12,15 @@ after any change to the modelling layer.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 
-python scripts/build_dataset.py --start 2016 --end 2024  # nflverse -> data/raw/*.parquet
+python scripts/build_dataset.py --start 2016 --end 2026  # nflverse -> data/raw/*.parquet (only rosters/schedules carry 2026)
 python scripts/build_features.py                         # data/raw -> data/processed/*.parquet
+python scripts/build_features.py --upcoming-season 2026  # + preseason_features.parquet for an unplayed season
 python scripts/validate_features.py                      # assert leakage-free + metrics sane
 
 python scripts/evaluate_benchmarks.py                    # walk-forward benchmark ladder -> stdout + parquet
+python scripts/train_model.py                            # ladder + learned model, same harness -> stdout + parquet
 python scripts/validate_projections.py                   # assert the harness fits on train seasons only
+python scripts/project_season.py --season 2026           # fit on all completed seasons -> draft board
 ```
 
 ### Architecture
@@ -28,9 +31,12 @@ python scripts/validate_projections.py                   # assert the harness fi
   `build_feature_table.py`.
 - `src/nflforecast/model/` — player-**season** grain. `panel.py` builds the draft-day panel (week-1
   feature snapshot + season labels lagged 1/2/3), `splits.py` the walk-forward folds, `benchmarks.py`
-  the ladder, `evaluate.py` the harness.
+  the ladder, `evaluate.py` the harness, `gbm.py` the learned projector. Everything implements one
+  `Projector` protocol (`fit(train) -> predict(test)`), so the model and the ladder are scored by the
+  same loop on the same rows.
 - `data/processed/` — `player_week_features.parquet` plus `player_week_labels.parquet` and
   `player_season_labels.parquet`, features and targets kept in **separate files on a shared key**.
+  `preseason_features.parquet` holds the same 161 columns for an unplayed season, deliberately apart.
 
 Scoped to **RB/WR/TE** (`config.SKILL_POSITIONS`). See `docs/feature_table.md` for the full column map.
 
@@ -48,11 +54,27 @@ metrics, paired bootstrap) — explicitly not adopted; don't build against it wi
 - **No feature module emits a raw current-week column.** Team-grain blocks shift(1)-then-roll;
   player-grain blocks roll inclusive and bind via `utils.attach_asof`, an as-of join at `week − 1`.
   Vegas lines are the one intentional exception — a closing line is known pre-kickoff.
-- **Nothing in `model/` is fitted outside a fold's training seasons.** Shrinkage constants and the age
-  curve are grid-fitted per fold on seasons < N. The draft-day information set is the **week-1 row** of
-  the feature table (already lagged) plus season labels at lag ≥ 1 — don't re-derive it per model.
+- **Nothing in `model/` is fitted outside a fold's training seasons.** Shrinkage constants, the age
+  curve, and the GBM's boosting-round budget (early-stopped on the fold's *last training season*) are
+  fitted per fold on seasons < N. The draft-day information set is the **week-1 row** of the feature
+  table (already lagged) plus season labels at lag ≥ 1 — don't re-derive it per model.
+- **The panel holds features and labels in one frame, so model inputs are chosen by exclusion.**
+  `gbm.py` drops anything prefixed `actual_`; add a new label to the panel and it stays out of the
+  design matrix by default. The walk-forward leakage check does *not* catch a label used as a feature
+  — it arrives via the training rows — so `validate_projections.py` asserts this separately.
+- **Week-1 columns published after drafts stay out of season projections** (`POST_DRAFT_COLS`: the two
+  injury-report columns and `depth_chart_rank`). They are worth ~1.3% RMSE; opt in with
+  `--with-post-draft` to measure, not to ship.
 - **Normalize team abbreviations before any join on team** (`config.normalize_team`). `load_schedules()`
   keeps historic codes (`OAK`/`SD`) while every other loader does not; unguarded joins fail silently.
+- **A season that has not started has no weekly rosters.** `load_rosters_weekly()` refuses it. The
+  preseason path (`spine.build_preseason_spine` + `utils.append_upcoming_week`) rebuilds the week-1
+  row from the *seasonal* roster file and lands it in `preseason_features.parquet` — never in the
+  feature table, and never in the label tables, because `build_panel` fills a missing outcome with 0
+  and would train on an unplayed season as a real zero.
+- **`roster_status` is the availability model.** Ablating it puts the games stage back at Marcel's
+  level (4.92 vs 4.95) and drops the model's overall edge from 8.2% to 3.2%. It is only informative
+  after late-August cuts; before then it is ~99% ACT. Rebuild after the cut deadline.
 - **nflverse has no offensive-coordinator field.** `scheme.py` falls back to head coach and reads an
   optional hand-maintained `data/manual/coordinators.csv` when present. Don't invent an OC source.
 

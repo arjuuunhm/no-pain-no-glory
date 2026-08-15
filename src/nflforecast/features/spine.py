@@ -47,6 +47,58 @@ from nflforecast.config import SKILL_POSITIONS, normalize_team
 ACTIVE_STATUSES = ("ACT", "INA", "RES", "PUP", "SUS")
 
 
+def build_preseason_spine(rosters: pl.DataFrame, season: int) -> pl.DataFrame:
+    """A synthetic week-1 spine for a season that has not been played yet.
+
+    `load_rosters_weekly()` does not carry a season before it starts -- it
+    refuses 2026 outright -- so a draft-day projection for an upcoming season
+    has no row to hang features off. The *seasonal* roster file does exist for
+    the upcoming season, carries the same `status` vocabulary as the weekly
+    one, and is the league's current answer to "who is on this team".
+
+    Emitting it as week 1 is what makes the rest of the pipeline work
+    unchanged: every feature block is keyed on (season, week) and already
+    lagged, so a week-1 row of season N picks up season N-1 information and
+    nothing else -- which is the whole definition of the draft-day information
+    set (see `model/panel.py`).
+
+    Two honest caveats, both about *when* this is built rather than how:
+
+    - `roster_status` is nearly constant before final cuts. In the training
+      seasons a week-1 row is ~81% ACT, because cuts and injured-reserve
+      designations have happened by then; a mid-August roster is ~99% ACT.
+      That column carries the availability model's entire edge, so a
+      projection built before the cut deadline is meaningfully weaker than
+      the backtest suggests, and rebuilding after cuts is not optional.
+    - `played` is False and `offense_snaps` 0 for every row, because no game
+      has been played. These rows must never reach a label table.
+    """
+    spine = (
+        rosters.filter(
+            (pl.col("season") == season)
+            & pl.col("position").is_in(SKILL_POSITIONS)
+            & pl.col("status").is_in(ACTIVE_STATUSES)
+            & pl.col("gsis_id").is_not_null()
+        )
+        .select(
+            pl.col("gsis_id").alias("player_id"),
+            pl.col("season").cast(pl.Int32),
+            pl.lit(1, dtype=pl.Int32).alias("week"),
+            "team",
+            "position",
+            pl.col("status").alias("roster_status"),
+            pl.col("full_name").alias("player_name"),
+        )
+        .with_columns(normalize_team("team"))
+        .sort(["player_id", "roster_status"])
+        .unique(subset=["player_id"], keep="first", maintain_order=True)
+    )
+    return spine.with_columns(
+        pl.lit(0, dtype=pl.Int64).alias("offense_snaps"),
+        pl.lit(False).alias("played"),
+    )
+
+
 def build_spine(rosters_weekly: pl.DataFrame, snap_counts: pl.DataFrame, players: pl.DataFrame) -> pl.DataFrame:
     """One row per (player_id, season, week) for rostered RB/WR/TE in REG weeks."""
     spine = (

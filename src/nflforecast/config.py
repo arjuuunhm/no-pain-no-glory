@@ -37,6 +37,11 @@ TEAM_ABBR_FIXES = {
     "SD": "LAC",
     "STL": "LA",
     "LAR": "LA",
+    # `load_rosters()` (seasonal) says AZ where every other loader says ARI.
+    # Found via the preseason spine, where it silently nulled every team-grain
+    # feature for one team's worth of players -- the exact failure mode this
+    # map exists to prevent.
+    "AZ": "ARI",
 }
 
 
