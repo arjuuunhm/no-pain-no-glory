@@ -1,0 +1,13 @@
+[project]
+name = "nflforecast"
+version = "0.1.0"
+description = "NFL fantasy/player-performance forecasting data pipeline (nflverse-based)"
+requires-python = ">=3.10"
+dependencies = [
+    "nflreadpy>=0.1.5",
+    "polars>=1.0",
+    "pyarrow>=15.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
