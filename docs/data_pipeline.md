@@ -15,33 +15,49 @@ pip install -e .
 ## Run
 
 ```bash
-python scripts/build_dataset.py --seasons 2022 2023 2024
+python scripts/build_dataset.py --seasons 2023 2024 2025
 # or a range:
-python scripts/build_dataset.py --start 2016 --end 2024
+python scripts/build_dataset.py --start 2016 --end 2025
 # skip a puller:
-python scripts/build_dataset.py --start 2016 --end 2024 --skip participation
+python scripts/build_dataset.py --start 2016 --end 2025 --skip participation
 ```
 
-Verified: ran successfully for seasons 2022-2024 and again for 2016-2024
-(9 seasons, all 13 pullers). Row counts from the 2016-2024 run:
+**Most loaders stop at the last completed season.** `rosters` and `schedules`
+carry the *upcoming* one (2026 as of this writing); `rosters_weekly` raises
+`ValueError: Season must be between 2002 and 2025` outright. To land the two
+that do without touching the twelve that cannot, skip the rest:
+
+```bash
+python scripts/build_dataset.py --start 2016 --end 2026 \
+  --skip weekly_stats snap_counts player_ids draft_picks ngs \
+         participation pbp rosters_weekly injuries depth_charts players
+```
+
+That pair is what the preseason projection path needs — see
+`docs/modeling.md`, "Projecting a season that has not been played".
+
+Row counts from the 2016-2025 run (all 13 pullers `ok`, plus the 2026
+rosters/schedules pass above):
 
 | File | Rows | Cols | Notes |
 |---|---:|---:|---|
-| `weekly_player_stats.parquet` | 162,833 | 150 | one row per player-game |
-| `snap_counts.parquet` | 226,494 | 16 | 2012+ only |
-| `rosters.parquet` | 27,868 | 36 | one row per player-season |
-| `player_ids.parquet` | 12,472 | 35 | crosswalk, not season-scoped |
-| `draft_picks.parquet` | 2,308 | 36 | |
-| `ngs_passing.parquet` | 5,328 | 29 | 2016+ only |
-| `ngs_receiving.parquet` | 13,329 | 23 | 2016+ only |
-| `ngs_rushing.parquet` | 5,411 | 22 | 2016+ only |
-| `schedules.parquet` | 2,476 | 46 | includes Vegas lines |
-| `participation.parquet` | 433,805 | 27 | play-level; coverage varies (see below) |
-| `pbp.parquet` | 435,483 | 36 | play-level, curated column subset (see below) |
-| `rosters_weekly.parquet` | 419,434 | 36 | week-by-week active/inactive status |
-| `injuries.parquet` | 49,488 | 16 | weekly injury report |
-| `depth_charts.parquet` | 332,174 | 15 | weekly official depth chart |
-| `players.parquet` | 25,035 | 39 | master bio/draft table, not season-scoped |
+| File | Rows | Cols | Seasons | Notes |
+|---|---:|---:|---|---|
+| `weekly_player_stats.parquet` | 182,255 | 150 | 2016-2025 | one row per player-game |
+| `snap_counts.parquet` | 253,106 | 16 | 2016-2025 | 2012+ only |
+| `rosters.parquet` | 33,935 | 36 | **2016-2026** | one row per player-season; carries the upcoming season |
+| `player_ids.parquet` | 12,472 | 35 | n/a | crosswalk, not season-scoped |
+| `draft_picks.parquet` | 2,565 | 36 | 2016-2025 | |
+| `ngs_passing.parquet` | 5,933 | 29 | 2016-2025 | 2016+ only |
+| `ngs_receiving.parquet` | 14,731 | 23 | 2016-2025 | 2016+ only |
+| `ngs_rushing.parquet` | 6,059 | 22 | 2016-2025 | 2016+ only |
+| `schedules.parquet` | 3,033 | 46 | **2016-2026** | Vegas lines; carries the upcoming season |
+| `participation.parquet` | 478,989 | 27 | 2016-2025 | play-level; coverage varies (see below) |
+| `pbp.parquet` | 484,254 | 36 | 2016-2025 | play-level, curated column subset (see below) |
+| `rosters_weekly.parquet` | 466,283 | 36 | 2016-2025 | week-by-week active/inactive status |
+| `injuries.parquet` | 55,556 | 17 | 2016-2025 | weekly injury report |
+| `depth_charts.parquet` | 886,389 | 26 | **2016-2024** | **stops early — see quirks below** |
+| `players.parquet` | 25,033 | 39 | n/a | master bio/draft table, not season-scoped |
 
 ## What each puller fetches
 
@@ -124,19 +140,51 @@ Verified: ran successfully for seasons 2022-2024 and again for 2016-2024
 
 ## nflverse quirks / data-quality findings
 
+- **A puller can report `ok` and land nothing.** `build_dataset.py` logs
+  per-puller success from *the absence of an exception*, and each puller logs
+  the season range it was **asked** for, not the one it wrote. When nflverse
+  changes a feed's schema, the puller's column selection can drop every row
+  of the new seasons while the run still prints `ok` and
+  `(seasons 2016-2025)`. This happened to `depth_charts` (below) and is not
+  specific to it. **After any refresh, verify per-file season coverage
+  rather than reading the summary table** — one query over `data/raw/*.parquet`
+  comparing `season.max()` against what you requested is enough.
+- **`load_depth_charts()` changed shape in 2025 and the puller silently
+  stops at 2024.** The historic feed was week-keyed (`season`, `week`,
+  `depth_team`, 26 columns after selection). From 2025 it is *dated
+  snapshots*: 12 columns keyed by a `dt` scrape timestamp, with `pos_rank`
+  in place of `depth_team` and no `season`/`week` at all. The puller keeps
+  only rows matching the old schema, so `depth_charts.parquet` ends at 2024
+  while claiming 2016-2025. Nothing in the default model path depends on it
+  — `depth_chart_rank` is excluded as post-draft information (see
+  `docs/modeling.md`) — so this is currently a latent problem rather than a
+  live one. The new feed being *dated* is also an opportunity: it is the
+  natural source for a genuine **preseason** depth chart, which is the one
+  thing that would justify putting the column back.
+- **`load_rosters()` says `AZ` where every other loader says `ARI`.** The
+  seasonal roster file uses its own Arizona abbreviation, in every season,
+  not just recent ones. Found via the preseason spine, where it nulled every
+  team-grain feature for one team's worth of players — no error, just a
+  column that was 3% null instead of 0%. `config.TEAM_ABBR_FIXES` now maps
+  it. This is the second instance of the same failure mode as the
+  schedules `OAK`/`SD` case below, which is the argument for normalising on
+  *every* team join rather than the ones known to be affected.
 - **Vegas lines live in `load_schedules()`, not a separate table.**
   `spread_line` / `total_line` / moneylines are populated columns on the
-  schedule row for every played game in the seasons we pulled (2016-2024,
-  0 nulls on `spread_line` for completed games).
-- **`load_schedules()` does *not* standardise team abbreviations, and every
-  other loader does.** Measured on 2016-2024: schedules carries `OAK` and
+  schedule row for every played game in the seasons we pulled (2016-2025,
+  0 nulls on `spread_line` for completed games). Lines are posted for the
+  upcoming season well before it starts: 2026 week 1 already has 0 nulls,
+  which is what makes them usable in a preseason projection.
+- **`load_schedules()` does *not* standardise team abbreviations, and most
+  other loaders do.** Measured on 2016-2025: schedules carries `OAK` and
   `SD` where `weekly_player_stats` and `pbp` carry `LV` and `LAC`. Joining
   on the raw column therefore silently drops every Raiders week 2016-2019
   and every Chargers week in 2016 — no error, just nulls, concentrated
   entirely in two franchises. Use `config.normalize_team()` before any join
   keyed on team; `scripts/validate_features.py` asserts the coverage.
 - **Participation coverage genuinely varies by season**, confirming the
-  warning in resources.md — measured directly on 2016-2024 data:
+  warning in resources.md — measured directly on 2016-2024 data (the
+  pattern holds through 2025):
   - `defenders_in_box`: ~26% null for 2016-2022, then **0% null in
     2023-2024** — a real coverage/methodology change, not noise.
   - `offense_formation`: ~27-28% null for 2016-2022, drops to ~20% null in
