@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Repository state
 
 Python 3.10+, polars-based, installed editable (`pip install -e .`). No test runner or linter is
-configured yet — `scripts/validate_features.py` is the closest thing to a test suite and should pass
-after any change to feature construction.
+configured yet — the two `validate_*.py` scripts are the closest thing to a test suite:
+`validate_features.py` should pass after any change to feature construction, `validate_projections.py`
+after any change to the modelling layer.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate && pip install -e .
@@ -14,6 +15,9 @@ python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 python scripts/build_dataset.py --start 2016 --end 2024  # nflverse -> data/raw/*.parquet
 python scripts/build_features.py                         # data/raw -> data/processed/*.parquet
 python scripts/validate_features.py                      # assert leakage-free + metrics sane
+
+python scripts/evaluate_benchmarks.py                    # walk-forward benchmark ladder -> stdout + parquet
+python scripts/validate_projections.py                   # assert the harness fits on train seasons only
 ```
 
 ### Architecture
@@ -22,14 +26,18 @@ python scripts/validate_features.py                      # assert leakage-free +
   Independent and re-runnable; `build_dataset.py` logs failures per-puller rather than aborting.
 - `src/nflforecast/features/` — feature blocks, each at a declared grain, all joined onto the spine by
   `build_feature_table.py`.
+- `src/nflforecast/model/` — player-**season** grain. `panel.py` builds the draft-day panel (week-1
+  feature snapshot + season labels lagged 1/2/3), `splits.py` the walk-forward folds, `benchmarks.py`
+  the ladder, `evaluate.py` the harness.
 - `data/processed/` — `player_week_features.parquet` plus `player_week_labels.parquet` and
   `player_season_labels.parquet`, features and targets kept in **separate files on a shared key**.
 
 Scoped to **RB/WR/TE** (`config.SKILL_POSITIONS`). See `docs/feature_table.md` for the full column map.
 
-Evaluation follows `resources.md` §5 (RMSE/MAE + Spearman + quantile calibration) and is **not yet
-implemented**. `docs/evaluation.md` records deferred alternatives (CRPS, rank-aware metrics, paired
-bootstrap) — explicitly not adopted; don't build against it without asking.
+Evaluation follows `resources.md` §5 (RMSE/MAE + Spearman + quantile calibration). Implemented in
+`model/metrics.py`; benchmark ladder rungs 0–2 are scored — see `docs/modeling.md` for the numbers a
+learned model has to beat. `docs/evaluation.md` records deferred alternatives (CRPS, rank-aware
+metrics, paired bootstrap) — explicitly not adopted; don't build against it without asking.
 
 ### Invariants worth not breaking
 
@@ -40,6 +48,9 @@ bootstrap) — explicitly not adopted; don't build against it without asking.
 - **No feature module emits a raw current-week column.** Team-grain blocks shift(1)-then-roll;
   player-grain blocks roll inclusive and bind via `utils.attach_asof`, an as-of join at `week − 1`.
   Vegas lines are the one intentional exception — a closing line is known pre-kickoff.
+- **Nothing in `model/` is fitted outside a fold's training seasons.** Shrinkage constants and the age
+  curve are grid-fitted per fold on seasons < N. The draft-day information set is the **week-1 row** of
+  the feature table (already lagged) plus season labels at lag ≥ 1 — don't re-derive it per model.
 - **Normalize team abbreviations before any join on team** (`config.normalize_team`). `load_schedules()`
   keeps historic codes (`OAK`/`SD`) while every other loader does not; unguarded joins fail silently.
 - **nflverse has no offensive-coordinator field.** `scheme.py` falls back to head coach and reads an
