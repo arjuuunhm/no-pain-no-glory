@@ -23,6 +23,13 @@ PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 # constant given availability and K/DST are separate problems entirely.
 SKILL_POSITIONS = ("RB", "WR", "TE")
 
+# The active historical sample and its unplayed forecast target. Raw files may
+# retain older seasons as a cache, but feature construction and every model
+# path operate only on this declared window.
+HISTORY_START_SEASON = 2019
+HISTORY_END_SEASON = 2025
+TARGET_SEASON = 2026
+
 # Trailing-window sizes used by every rolling feature block. One definition so
 # opportunity/red-zone/game-script/O-line features stay directly comparable.
 ROLLING_WINDOWS = (3, 5, 8)

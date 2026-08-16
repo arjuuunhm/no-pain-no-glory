@@ -14,8 +14,13 @@ pip install -e .
 
 ## Run
 
+The active modeling history is **2019–2025** and the forecast target is
+**2026**. Older rows may remain in `data/raw/` as a cache, but feature
+construction filters them out at ingestion. The default dataset pull matches
+this window:
+
 ```bash
-python scripts/build_dataset.py --seasons 2023 2024 2025
+python scripts/build_dataset.py
 # or a range:
 python scripts/build_dataset.py --start 2016 --end 2025
 # skip a puller:
@@ -58,6 +63,7 @@ rosters/schedules pass above):
 | `injuries.parquet` | 55,556 | 17 | 2016-2025 | weekly injury report |
 | `depth_charts.parquet` | 886,389 | 26 | **2016-2024** | **stops early — see quirks below** |
 | `players.parquet` | 25,033 | 39 | n/a | master bio/draft table, not season-scoped |
+| `ff_rankings.parquet` | 2,455 | 10 | 2021-2026 | archived FantasyPros ECR snapshots; external input, not nflverse |
 
 ## What each puller fetches
 

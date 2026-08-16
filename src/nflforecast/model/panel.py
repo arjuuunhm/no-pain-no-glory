@@ -30,7 +30,14 @@ from __future__ import annotations
 
 import polars as pl
 
-from nflforecast.config import PROCESSED_DIR, SKILL_POSITIONS, get_logger
+from nflforecast.config import (
+    HISTORY_END_SEASON,
+    HISTORY_START_SEASON,
+    PROCESSED_DIR,
+    SKILL_POSITIONS,
+    get_logger,
+)
+from nflforecast.model.market import attach_preseason_ecr
 
 logger = get_logger("panel")
 
@@ -47,6 +54,7 @@ _SNAPSHOT_COLS = [
     "position",
     "age_years",
     "years_exp",
+    "draft_year",
     "draft_round",
     "draft_pick",
     "is_undrafted",
@@ -88,6 +96,7 @@ def season_opportunity(week_labels: pl.DataFrame | None = None) -> pl.DataFrame:
     """
     if week_labels is None:
         week_labels = pl.read_parquet(PROCESSED_DIR / "player_week_labels.parquet")
+    week_labels = week_labels.filter(pl.col("season").is_between(HISTORY_START_SEASON, HISTORY_END_SEASON))
     return week_labels.group_by(["player_id", "season"]).agg(
         pl.col("targets").sum().alias("targets"),
         pl.col("carries").sum().alias("carries"),
@@ -111,7 +120,8 @@ def build_panel(
 
     Columns:
       keys        player_id, season, team, position
-      pre-season  age_years, years_exp, draft_round, draft_pick, is_undrafted
+      pre-season  age_years, years_exp, is_rookie, draft_year, draft_round,
+                  draft_pick, is_undrafted
       priors      prev{1,2,3}_{points,games,ppg,targets,carries,rec_points,
                   rush_points}, n_prior_seasons, has_history
       actuals     actual_points, actual_games, actual_ppg, actual_targets,
@@ -121,6 +131,14 @@ def build_panel(
         features = pl.read_parquet(PROCESSED_DIR / "player_week_features.parquet")
     if season_labels is None:
         season_labels = pl.read_parquet(PROCESSED_DIR / "player_season_labels.parquet")
+    features = features.filter(pl.col("season").is_between(HISTORY_START_SEASON, HISTORY_END_SEASON))
+    season_labels = season_labels.filter(
+        pl.col("season").is_between(HISTORY_START_SEASON, HISTORY_END_SEASON)
+    )
+    if week_labels is not None:
+        week_labels = week_labels.filter(
+            pl.col("season").is_between(HISTORY_START_SEASON, HISTORY_END_SEASON)
+        )
 
     # Week 1 is the draft-day snapshot. `unique` guards against a player
     # appearing on two rosters in the same week-1 (rare, but rosters_weekly
@@ -142,7 +160,7 @@ def build_panel(
         )
     )
 
-    panel = snapshot.join(actuals, on=["player_id", "season"], how="left")
+    panel = attach_preseason_ecr(snapshot).join(actuals, on=["player_id", "season"], how="left")
 
     # A rostered player who never appeared scored zero points across zero
     # games. Points are a real zero; per-game is genuinely undefined and stays
@@ -170,6 +188,15 @@ def build_panel(
         ),
     ).with_columns(
         pl.col("prev1_games").is_not_null().alias("has_history"),
+        # `has_history=False` is broader than rookie: it also includes players
+        # returning after a year out of the league. Experience is the primary
+        # source because draft_year is null for many UDFAs; draft year is only
+        # a fallback for the handful of rows whose experience is missing.
+        pl.when(pl.col("years_exp").is_not_null())
+        .then(pl.col("years_exp") == 0)
+        .otherwise(pl.col("draft_year") == pl.col("season"))
+        .fill_null(False)
+        .alias("is_rookie"),
     )
 
     panel = panel.sort(["season", "player_id"])
@@ -200,6 +227,9 @@ def build_preseason_panel(
         preseason_features = pl.read_parquet(PRESEASON_FEATURES_PATH)
     if season_labels is None:
         season_labels = pl.read_parquet(PROCESSED_DIR / "player_season_labels.parquet")
+    season_labels = season_labels.filter(
+        pl.col("season").is_between(HISTORY_START_SEASON, HISTORY_END_SEASON)
+    )
 
     snapshot = (
         preseason_features.filter(pl.col("season") == season)
@@ -223,7 +253,7 @@ def build_preseason_panel(
         )
     )
 
-    panel = snapshot
+    panel = attach_preseason_ecr(snapshot)
     for lag in PRIOR_LAGS:
         prior = actuals.rename(
             {
@@ -241,6 +271,11 @@ def build_preseason_panel(
         ),
     ).with_columns(
         pl.col("prev1_games").is_not_null().alias("has_history"),
+        pl.when(pl.col("years_exp").is_not_null())
+        .then(pl.col("years_exp") == 0)
+        .otherwise(pl.col("draft_year") == pl.col("season"))
+        .fill_null(False)
+        .alias("is_rookie"),
     )
 
     logger.info(
@@ -252,7 +287,9 @@ def build_preseason_panel(
     return panel.sort("player_id")
 
 
-def snapshot_features(features: pl.DataFrame | None = None) -> pl.DataFrame:
+def snapshot_features(
+    features: pl.DataFrame | None = None, *, include_market: bool = False
+) -> pl.DataFrame:
     """The full week-1 feature row per (player_id, season), for model stages.
 
     The benchmark ladder does not need this -- it runs off the panel's prior
@@ -261,9 +298,11 @@ def snapshot_features(features: pl.DataFrame | None = None) -> pl.DataFrame:
     """
     if features is None:
         features = pl.read_parquet(PROCESSED_DIR / "player_week_features.parquet")
-    return (
+    features = features.filter(pl.col("season").is_between(HISTORY_START_SEASON, HISTORY_END_SEASON))
+    snapshot = (
         features.filter(pl.col("week") == 1)
         .filter(pl.col("position").is_in(SKILL_POSITIONS))
         .unique(subset=["player_id", "season"], keep="first")
         .drop("week")
     )
+    return attach_preseason_ecr(snapshot) if include_market else snapshot

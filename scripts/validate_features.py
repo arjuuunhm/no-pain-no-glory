@@ -25,7 +25,13 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nflforecast.config import PROCESSED_DIR, RAW_DIR, get_logger
+from nflforecast.config import (
+    HISTORY_END_SEASON,
+    HISTORY_START_SEASON,
+    PROCESSED_DIR,
+    RAW_DIR,
+    get_logger,
+)
 
 logger = get_logger("validate")
 
@@ -165,8 +171,12 @@ def check_labels_separated(features: pl.DataFrame, weekly_labels: pl.DataFrame) 
 def main() -> int:
     features = pl.read_parquet(PROCESSED_DIR / "player_week_features.parquet")
     weekly_labels = pl.read_parquet(PROCESSED_DIR / "player_week_labels.parquet")
-    weekly_stats = pl.read_parquet(RAW_DIR / "weekly_player_stats.parquet")
-    pbp = pl.read_parquet(RAW_DIR / "pbp.parquet")
+    weekly_stats = pl.read_parquet(RAW_DIR / "weekly_player_stats.parquet").filter(
+        pl.col("season").is_between(HISTORY_START_SEASON, HISTORY_END_SEASON)
+    )
+    pbp = pl.read_parquet(RAW_DIR / "pbp.parquet").filter(
+        pl.col("season").is_between(HISTORY_START_SEASON, HISTORY_END_SEASON)
+    )
 
     logger.info("Validating %s rows x %s cols", features.height, features.width)
     results = [

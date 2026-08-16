@@ -3,6 +3,7 @@
 
 Usage:
     python scripts/train_model.py
+    python scripts/train_model.py --rookies --with-market
     python scripts/train_model.py --blend-weight 0.35
     python scripts/train_model.py --with-post-draft      # measure the held-back columns
 
@@ -28,9 +29,9 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nflforecast.config import PROCESSED_DIR, get_logger
-from nflforecast.model.benchmarks import default_ladder
+from nflforecast.model.benchmarks import ConsensusECR, PositionalMean, default_ladder
 from nflforecast.model.evaluate import run_walk_forward, summarise
-from nflforecast.model.gbm import GBMProjector
+from nflforecast.model.gbm import GBMProjector, RookieGBMProjector
 from nflforecast.model.panel import snapshot_features
 
 logger = get_logger("train")
@@ -41,7 +42,13 @@ MODEL_PREDICTIONS_PATH = PROCESSED_DIR / "model_predictions.parquet"
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--min-train-seasons", type=int, default=3)
-    p.add_argument("--include-rookies", action="store_true")
+    p.add_argument(
+        "--rookies",
+        "--include-rookies",
+        dest="rookies",
+        action="store_true",
+        help="run a true-rookie-only evaluation using models fitted on prior rookie classes",
+    )
     p.add_argument(
         "--with-post-draft",
         action="store_true",
@@ -54,6 +61,11 @@ def parse_args() -> argparse.Namespace:
         help="if > 0, also score a GBM/Marcel stage-level blend at this weight on Marcel",
     )
     p.add_argument("--importances", action="store_true", help="print gain by feature per stage")
+    p.add_argument(
+        "--with-market",
+        action="store_true",
+        help="score ECR and fit a separate market-informed GBM (the default GBM remains football-only)",
+    )
     return p.parse_args()
 
 
@@ -62,10 +74,38 @@ def main() -> int:
 
     # One snapshot read, shared by every model instance -- it is the same
     # frame, and re-reading it per projector is 16MB of parquet per fit.
-    snapshot = snapshot_features()
-    model = GBMProjector(snapshot=snapshot, include_post_draft=args.with_post_draft)
-    projectors = [*default_ladder(), model]
-    if args.blend_weight > 0:
+    snapshot = snapshot_features(include_market=args.with_market)
+    projector_cls = RookieGBMProjector if args.rookies else GBMProjector
+    model = projector_cls(snapshot=snapshot, include_post_draft=args.with_post_draft)
+    if args.rookies:
+        # Historical rungs have no player prior for a rookie. The honest floor
+        # is the rookie positional mean, followed by football context, then
+        # market consensus and a model that explicitly consumes it.
+        projectors = [PositionalMean(rookies_only=True), model]
+        if args.with_market:
+            projectors.extend(
+                [
+                    ConsensusECR(rookies_only=True),
+                    RookieGBMProjector(
+                        name="rookie_gbm_market",
+                        snapshot=snapshot,
+                        include_post_draft=args.with_post_draft,
+                        include_market=True,
+                    ),
+                ]
+            )
+    else:
+        projectors = [*default_ladder(include_market=args.with_market), model]
+        if args.with_market:
+            projectors.append(
+                GBMProjector(
+                    name="gbm_market",
+                    snapshot=snapshot,
+                    include_post_draft=args.with_post_draft,
+                    include_market=True,
+                )
+            )
+    if args.blend_weight > 0 and not args.rookies:
         projectors.append(
             GBMProjector(
                 name="gbm_marcel_blend",
@@ -78,7 +118,8 @@ def main() -> int:
     metrics, predictions = run_walk_forward(
         projectors=projectors,
         min_train_seasons=args.min_train_seasons,
-        require_history=not args.include_rookies,
+        scoring_cohort="rookies" if args.rookies else "history",
+        common_coverage=args.rookies and args.with_market,
     )
 
     with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3):

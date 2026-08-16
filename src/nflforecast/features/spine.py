@@ -67,9 +67,8 @@ def build_preseason_spine(rosters: pl.DataFrame, season: int) -> pl.DataFrame:
     - `roster_status` is nearly constant before final cuts. In the training
       seasons a week-1 row is ~81% ACT, because cuts and injured-reserve
       designations have happened by then; a mid-August roster is ~99% ACT.
-      That column carries the availability model's entire edge, so a
-      projection built before the cut deadline is meaningfully weaker than
-      the backtest suggests, and rebuilding after cuts is not optional.
+      It is retained here only to define the active-roster spine; the learned
+      projection deliberately does not use it as a feature.
     - `played` is False and `offense_snaps` 0 for every row, because no game
       has been played. These rows must never reach a label table.
     """

@@ -1,7 +1,11 @@
 # Modelling — panel, walk-forward harness, benchmark ladder
 
 Status: **benchmarks and a learned model implemented and scored.** The model
-clears rung 1 in every fold; see [The learned model](#the-learned-model).
+clears rung 1 in every fold; see [The learned model](#the-learned-model). Its
+opportunity stage predicts per **scheduled game**, using each week's real
+opponent, and a season projection sums over the real schedule rather than
+multiplying by one flat rate — see
+[The opportunity stage is per game, not per season](#the-opportunity-stage-is-per-game-not-per-season).
 
 `resources.md` §5 says the ladder is what a model has to beat, and
 `docs/evaluation.md` parks its own open questions "until there is a model
@@ -126,20 +130,24 @@ Per-fold RMSE on points — Marcel wins four of five, and loses 2021 by 0.3:
 
 ### Known limitations
 
-- **Rookies are not scored.** ~100 per season are excluded (`--include-rookies`
-  to see them), because rung 1 is undefined without a prior season and can only
-  give them the positional mean. That is a real part of a draft board the
-  ladder cannot speak to; draft capital in the panel is there for whatever
-  eventually does.
+- **Rookies use a separate evaluation.** Rung 1 is undefined without an NFL
+  prior, so `--rookies` means a true rookie-only cohort
+  (`is_rookie`, derived from `years_exp`, not `has_history=False`). The rookie
+  ladder starts at a positional mean; `--with-market` adds archived ECR and
+  intersects every projector to the same ECR-covered player-seasons.
 - **Shrinkage is fitted on unweighted per-game RMSE**, so the fit is dominated
   by the bottom of the pool, where near-zero projections are easy. The fitted
   k is small (2.5 games for rung 1) partly for that reason. Fitting on a
   games-weighted or draftable-only slice would shrink the top of the board
   differently, and is the first thing to revisit.
-- **Rungs 3 and 4 (consensus ADP/ECR, Vegas-informed) are missing**, because
-  no puller lands ADP. Vegas lines are in the feature table but only per game,
-  not as season win totals. Rung 3 is the one that matters — §5 calls ADP the
-  benchmark you must beat, and rungs 1–2 are markedly easier.
+- **Rung 3 is available when archived consensus data is present.**
+  `data/raw/ff_rankings.parquet` is FantasyPros **ECR**, not ADP; the model
+  selects each season's latest snapshot no later than the day before Week 1
+  and never substitutes a live ranking for history. Run the ladder with
+  `--with-market` to score it, or `train_model.py --with-market` to add the
+  separate `gbm_market` result. Its coverage is narrower than the football
+  panel and begins in 2021, so compare it only on its reported rows. Rung 4
+  remains missing: game-level Vegas lines are not season win totals.
 
 ## The learned model
 
@@ -154,7 +162,7 @@ pred_points = pred_games × (tgt_per_game × pts_per_target
 | Stage | How | Rows it fits on |
 |---|---|---|
 | availability | LightGBM, `pred_games` | all, including never-played |
-| opportunity | LightGBM ×2, targets and carries per game | played, weighted by games |
+| opportunity | LightGBM ×2, targets and carries **per scheduled game** | real games, one row each |
 | efficiency | **not learned** — shrunk to the positional mean | played |
 
 Only the first two stages are learned. §4 says to regress efficiency toward
@@ -165,6 +173,34 @@ k = 1,000 targets and 5,000 carries — far beyond any career — which is the
 grid's way of saying *use the positional mean*. A GBDT fitted here would be
 fitting touchdown variance.
 
+### The opportunity stage is per game, not per season
+
+`tgt_pg`/`car_pg` used to be one row per player-*season*, fit on the season's
+average rate. They are now one row per player-**game** — real historical
+games for training, every game on the target season's real schedule for
+projection — carrying that specific week's opponent (`opponent`, a
+categorical) and that opponent's `prev_season_opp_*` (the defense's
+*completed prior year*; never the in-season rolling form, which is illegal
+for any week beyond the first on an unplayed season). `model/gbm.py`'s
+`_expand_to_games` builds this frame identically for training and serving —
+a training row and a serving row go through the exact same transform, so a
+draft-day projection is never asking the model to extrapolate to an input
+shape it never trained on.
+
+A season projection is then a **sum over the real 17-ish games on the
+schedule**: predict every game, multiply by the (still season-level, not
+matchup-aware) efficiency rate, weight each game by the availability stage's
+implied per-game play probability, and add them up. This is the concrete
+answer to `features/matchup.py`'s premise — "this back faces four bad run
+defenses in weeks 3-6" now has somewhere to enter a season total that a flat
+per-game rate never had.
+
+Efficiency stays season-level and un-matchup-aware on purpose: §4's
+opportunity/efficiency split says volume is what a defense's strength should
+move, and `matchup.py`'s own profile is built as opponent volume conceded
+(plays, dropbacks, targets by position), not points allowed, for the same
+reason.
+
 The panel carries features and labels in one frame, so the design matrix is
 built by **exclusion**: everything not named in `_DROP` and not prefixed
 `actual_`. The first version of this model omitted that prefix rule and scored
@@ -174,44 +210,67 @@ outcome column — the walk-forward leakage check does not catch this, since the
 labels arrive through the *training* rows, where they are not leakage in the
 temporal sense, merely the answer.
 
-### Results — 2020–2024 walk-forward, ~390 players/season
+### Results — 2020–2025 walk-forward, ~390 players/season
 
-Season PPR total (mean over folds):
+Re-measured after the per-game refactor below; one more test season (2025)
+is in the panel than the numbers this section used to report, so read the
+mean columns as "flat, within the noise `docs/evaluation.md` warns about at
+n≈390" rather than compare digit-for-digit against an older copy of this
+page. Season PPR total (mean over folds):
 
 | Projector | RMSE | MAE | Spearman | q10 cov | q50 cov | q90 cov |
 |---|---|---|---|---|---|---|
-| `gbm` | **51.4** | **37.4** | **0.805** | 0.20 | 0.55 | 0.87 |
-| `marcel` | 55.8 | 40.8 | 0.724 | 0.22 | 0.53 | 0.90 |
-| `last_season_regressed` | 56.5 | 42.2 | 0.720 | 0.22 | 0.50 | 0.90 |
-| `positional_mean` | 82.3 | 65.5 | 0.142 | 0.18 | 0.49 | 0.89 |
+| `gbm` | **51.8** | **37.8** | **0.810** | 0.19 | 0.56 | 0.88 |
+| `marcel` | 55.7 | 40.4 | 0.729 | 0.22 | 0.53 | 0.90 |
+| `last_season_regressed` | 56.4 | 41.8 | 0.726 | 0.22 | 0.50 | 0.90 |
+| `positional_mean` | 82.6 | 65.8 | 0.138 | 0.18 | 0.49 | 0.89 |
 
-Per fold, points RMSE — **the model wins all five**, by 4–6 points each:
+Per fold, points RMSE — **the model wins all six**:
 
 | Test season | `gbm` | `marcel` | rung 1 | floor |
 |---|---|---|---|---|
-| 2020 | **53.1** | 58.2 | 58.9 | 80.0 |
-| 2021 | **51.9** | 57.8 | 57.5 | 81.1 |
-| 2022 | **48.8** | 50.9 | 53.3 | 82.1 |
-| 2023 | **50.2** | 54.4 | 54.9 | 83.4 |
-| 2024 | **52.8** | 57.5 | 57.8 | 84.8 |
+| 2020 | **53.9** | 58.2 | 58.9 | 80.0 |
+| 2021 | **52.2** | 57.8 | 57.5 | 81.1 |
+| 2022 | **49.5** | 50.9 | 53.3 | 82.1 |
+| 2023 | **50.3** | 54.4 | 54.9 | 83.4 |
+| 2024 | **53.9** | 57.5 | 57.8 | 84.8 |
+| 2025 | **50.7** | 55.4 | 55.8 | 84.5 |
 
-That is 9.1% mean RMSE improvement over rung 1, won in every fold rather than
-on average — which matters, because at n≈390 the ladder's own 1% spread is
-noise. Per stage:
+That is 8.2% mean RMSE improvement over rung 1, won in every fold rather than
+on average. Per stage:
 
 | Stage | `gbm` RMSE | `marcel` RMSE | `gbm` Spearman | `marcel` Spearman |
 |---|---|---|---|---|
-| points per game | **3.22** | 3.30 | **0.801** | 0.775 |
-| games played | **4.12** | 4.95 | **0.538** | 0.387 |
+| points per game | **3.19** | 3.24 | **0.809** | 0.785 |
+| games played | **4.13** | 4.99 | **0.543** | 0.386 |
 
 ### What the numbers say
 
+- **The per-game refactor moved the ppg stage a little, in the right
+  direction, and the season total barely.** Before `_expand_to_games` (one
+  flat rate per player-season) the ppg stage scored 3.22 RMSE; matchup-aware
+  and summed over the real schedule, it scores 3.19. That is the effect
+  `features/matchup.py` set out to add, and it is real but small, which
+  matches its own module docstring's caveat: "a defense's prior season is a
+  mediocre forecast of its current one... that is an argument for shrinking
+  the matchup effect, not for dropping it" — and shrinking toward nothing
+  much is exactly what the fitted booster does (a top team-week volume
+  swings a projected back's carries by well under half a carry; see
+  `_expand_to_games` for how to inspect a specific player's per-game spread).
+  The season total is still dominated by the (unchanged) availability stage,
+  the same finding the rest of this section already made below.
 - **The gain is mostly availability, which is the opposite of what the ladder
   predicted.** The benchmark section above argued a model improving only the
-  per-game half would move the total very little — correct, and the model
-  barely does improve it (3.30 → 3.22). The season total moved because *games
-  played* did (4.95 → 4.12, Spearman 0.387 → 0.538).
-- **And that gain is one column.** Ablating week-1 `roster_status` gives:
+  per-game half would move the total very little — still true, more so now
+  that the per-game half is matchup-aware and still barely moves it. The
+  season total moves because *games played* does.
+- **And that gain is one column.** The `roster_status` ablation and the
+  Marcel-blend comparison below were measured against the season-direct
+  model, before this page's per-game refactor, and have not been re-run
+  since — both are architecturally untouched by that refactor (stage 1 and
+  the blend logic are unchanged), so there is no specific reason to expect
+  them to move, but treat the exact numbers as last measured pre-refactor
+  rather than current:
 
   | | points RMSE | games RMSE | games Spearman |
   |---|---|---|---|
@@ -229,16 +288,17 @@ noise. Per stage:
   targets model, with the volatility columns (`targets_std`, `wopr_std`) next —
   the model is reading both the level and the reliability of a player's
   workload, which is the thing a weighted average of points cannot express.
-- **The quantiles improved but are still too tight on the left.** 20% of
+- **The quantiles improved but are still too tight on the left.** 19% of
   players fall below their q10, against 22% for the benchmark's constant
   offset. Better, and now feature-dependent, but not calibrated — the honest
   reading is that this is the least finished part of the model.
-- **Blending with Marcel did not help.** At weight 0.35 the blend scores 51.8
-  against the model's 51.4, losing four folds of five. §4 expects the ensemble
-  to win; it does not here, and the plausible reason is that the model already
-  consumes Marcel-shaped priors as engineered features (`prior_ppg`,
-  `prior_tgt_per_game`), so the blend re-weights information it already has.
-  Kept behind `--blend-weight`, off by default.
+- **Blending with Marcel did not help** (pre-refactor measurement, see above).
+  At weight 0.35 the blend scores 51.8 against the model's 51.4, losing four
+  folds of five. §4 expects the ensemble to win; it does not here, and the
+  plausible reason is that the model already consumes Marcel-shaped priors as
+  engineered features (`prior_ppg`, `prior_tgt_per_game`), so the blend
+  re-weights information it already has. Kept behind `--blend-weight`, off by
+  default.
 
 ### The draft-day information set
 
@@ -253,18 +313,29 @@ with `--with-post-draft`. That is small enough that the honest default is
 cheap, and the right response to wanting it back is to pull a genuine
 preseason depth chart, not to relabel these as draft-day facts.
 
-`roster_status` is the borderline case and is **kept**: week-1 reserve/PUP/
-suspension designations mostly follow final roster cuts in late August, which
-is at or before a typical draft. It is also the availability stage's largest
-single feature, so if that call is wrong, the availability gain above is
-overstated. Worth revisiting before trusting this on a live draft board.
+`roster_status` is **not a model feature**. It remains in the upstream spine so
+the dataset can distinguish active-roster players from practice-squad and
+released rows, but the learned projection cannot use the status itself to
+predict availability.
 
 ### Known limitations
 
-- **Rookies are still not scored** (`--include-rookies`). The model can at
-  least form an opinion on them — draft capital and the team-grain features
-  are populated — where rung 1 cannot, so this is now a real comparison the
-  harness is declining to make rather than one it cannot.
+- **Rookies have their own fitted model.** `train_model.py --rookies`
+  fits `RookieGBMProjector` only on earlier rookie classes, where draft capital
+  and preseason team context replace missing NFL priors. Add `--with-market`
+  to score a separate market-informed rookie model and archived ECR on common
+  coverage. In the current 2022-2025 folds (242 ECR-covered rookies), ECR is
+  still the bar: 55.66 RMSE / 0.617 Spearman versus 62.88 / 0.437 for the
+  football model and 60.61 / 0.488 for the market-informed GBM. The production
+  draft board uses the rookie-specific football model for rows flagged
+  `is_rookie`; with `--with-market`, calibrated rookie ECR replaces it where
+  covered and the football model remains the fallback. `projection_source` in
+  the board records that choice row by row.
+- **Third-party stat projections are not yet an input.** No timestamped
+  historical projection file exists in the repository. When one is added, use
+  archived games/targets/carries/receptions rather than only projected fantasy
+  points, score it as its own rung first, and label any consuming GBM as
+  market-informed; never backfill old folds from a current projection page.
 - **Hyperparameters are fixed, not searched.** One shallow, heavily
   regularised configuration, with only the round count tuned per fold on the
   last training season. At ~2,000 training rows a real search would need a
@@ -313,16 +384,9 @@ season to hold out, and no scoring, because there are no outcomes yet.
 
 ### What a projection built today is worth
 
-Less than the backtest suggests, for one specific reason. `roster_status`
-carries the model's entire availability edge, and it is only informative once
-final cuts and injured-reserve designations have happened. Measured on the
-2026 roster in mid-August: **99% ACT**, against 81% in the training seasons'
-week-1 rows. The column is present and populated, but nearly constant, so the
-availability stage is currently operating closer to its ablated form — the
-3.2%-over-Marcel row of the table above, not the 8.2% one.
-
-**Rebuild after the late-August cut deadline.** That is not a refinement; it
-is the difference between the two rows.
+Less than the backtest suggests: the model no longer uses `roster_status`
+directly, so its availability estimate must come from historical
+participation, injuries, depth, and other lagged information.
 
 Two smaller gaps in a preseason build, both benign but worth knowing:
 

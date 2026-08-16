@@ -3,7 +3,7 @@
 
 Usage:
     python scripts/evaluate_benchmarks.py
-    python scripts/evaluate_benchmarks.py --min-train-seasons 2 --include-rookies
+    python scripts/evaluate_benchmarks.py --rookies --with-market
 
 Run after build_features.py. Prints a per-fold table and a leaderboard, and
 writes every projection to data/processed/projection_predictions.parquet.
@@ -25,6 +25,7 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nflforecast.config import get_logger
+from nflforecast.model.benchmarks import ConsensusECR, PositionalMean, default_ladder
 from nflforecast.model.evaluate import PREDICTIONS_PATH, run_walk_forward, summarise
 
 logger = get_logger("benchmarks")
@@ -39,9 +40,16 @@ def parse_args() -> argparse.Namespace:
         help="minimum panel seasons before a fold is scored (default: 3)",
     )
     p.add_argument(
-        "--include-rookies",
+        "--with-market",
         action="store_true",
-        help="score players with no prior season too (benchmarks can only give them the positional mean)",
+        help="include the archived FantasyPros ECR benchmark where a preseason snapshot exists",
+    )
+    p.add_argument(
+        "--rookies",
+        "--include-rookies",
+        dest="rookies",
+        action="store_true",
+        help="score only true rookies; historical-prior rungs are replaced by a rookie positional mean",
     )
     return p.parse_args()
 
@@ -49,9 +57,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    if args.rookies:
+        projectors = [PositionalMean(rookies_only=True)]
+        if args.with_market:
+            projectors.append(ConsensusECR(rookies_only=True))
+    else:
+        projectors = default_ladder(include_market=args.with_market)
+
     metrics, predictions = run_walk_forward(
+        projectors=projectors,
         min_train_seasons=args.min_train_seasons,
-        require_history=not args.include_rookies,
+        scoring_cohort="rookies" if args.rookies else "history",
+        common_coverage=args.rookies and args.with_market,
     )
 
     with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=3):

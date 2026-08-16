@@ -18,7 +18,7 @@ from pathlib import Path
 # Allow running as `python scripts/build_dataset.py` without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from nflforecast.config import get_logger
+from nflforecast.config import HISTORY_END_SEASON, HISTORY_START_SEASON, get_logger
 from nflforecast.pullers import (
     pull_weekly_player_stats,
     pull_snap_counts,
@@ -41,8 +41,14 @@ logger = get_logger("build_dataset")
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--seasons", type=int, nargs="+", help="Explicit list of seasons, e.g. --seasons 2022 2023 2024")
-    p.add_argument("--start", type=int, default=2022, help="Start season (inclusive) if --seasons not given")
-    p.add_argument("--end", type=int, default=2024, help="End season (inclusive) if --seasons not given")
+    p.add_argument(
+        "--start", type=int, default=HISTORY_START_SEASON,
+        help="Start season (inclusive) if --seasons not given",
+    )
+    p.add_argument(
+        "--end", type=int, default=HISTORY_END_SEASON,
+        help="End season (inclusive) if --seasons not given",
+    )
     p.add_argument(
         "--skip",
         nargs="*",

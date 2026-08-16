@@ -16,7 +16,9 @@ Checks:
   5. Predictions stay inside the physically possible range.
   6. No outcome column reaches the learned model's design matrix.
   7. The learned model clears rung 1 in every fold -- resources.md §5's bar.
-  8. The preseason table, if built, is projectable and carries no outcomes.
+  8. Rookie status is experience-based, not inferred from missing history.
+  9. Market consensus reaches only explicitly market-informed models.
+ 10. The preseason table, if built, is projectable and carries no outcomes.
 
 The learned model is included in the walk-forward, so checks 2 and 5 cover it
 too. That costs about a minute; the alternative is a test suite that validates
@@ -35,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from nflforecast.config import PROCESSED_DIR, get_logger
 from nflforecast.model.benchmarks import default_ladder, last_season_regressed
 from nflforecast.model.evaluate import run_walk_forward
-from nflforecast.model.gbm import GBMProjector
+from nflforecast.model.gbm import GBMProjector, MARKET_COLS
 from nflforecast.model.panel import (
     PRESEASON_FEATURES_PATH,
     build_panel,
@@ -212,6 +214,25 @@ def check_prediction_ranges(predictions: pl.DataFrame) -> bool:
     )
 
 
+def _fit_game_design(panel: pl.DataFrame) -> GBMProjector:
+    """A model with `_game_design` fitted the way `fit()` does, boosters untrained.
+
+    Shared by the two checks below so the per-game frame -- `_expand_to_games`
+    joined to the real weekly outcome, exactly stage 2's training input -- is
+    only built once.
+    """
+    model = GBMProjector(snapshot=_SNAPSHOT if _SNAPSHOT is not None else snapshot_features())
+    train = panel.filter(pl.col("season") < 2024)
+    weekly_y = model._weekly_labels.filter(pl.col("played")).select(
+        "player_id", "season", "week", "targets", "carries"
+    )
+    game_frame = model._expand_to_games(train).join(
+        weekly_y, on=["player_id", "season", "week"], how="inner"
+    )
+    model._game_design.fit(game_frame)
+    return model
+
+
 def check_no_outcome_features(panel: pl.DataFrame) -> bool:
     """No `actual_*` column may appear in the learned model's design matrix.
 
@@ -222,15 +243,102 @@ def check_no_outcome_features(panel: pl.DataFrame) -> bool:
     one that would have caught it, and check 2 alone would not have: the
     labels reach the model through the *training* rows, where they are not
     corrupted and not leakage in the temporal sense, merely the answer.
+
+    Covers both designs: the season-grain `_design` and stage 2's per-game
+    `_game_design`, which joins the real weekly outcome onto its training
+    frame and so has its own way to leak (`targets`/`carries` becoming
+    features of themselves) that `_design` never sees.
     """
     model = GBMProjector(snapshot=_SNAPSHOT if _SNAPSHOT is not None else snapshot_features())
     frame = model._design_frame(panel.filter(pl.col("season") < 2024))
     model._design.fit(frame)
+    game_model = _fit_game_design(panel)
+
     outcomes = [c for c in model._design.columns if c.startswith("actual_")]
+    outcomes += [
+        c
+        for c in game_model._game_design.columns
+        if c.startswith("actual_") or c in ("targets", "carries")
+    ]
+    roster_status = [
+        c
+        for c in (*model._design.columns, *game_model._game_design.columns)
+        if c == "roster_status"
+    ]
+    n_features = len(model._design.columns) + len(game_model._game_design.columns)
     return check(
-        "no outcome column is a model feature",
-        not outcomes,
-        f"{len(model._design.columns)} features, {len(outcomes)} outcome columns{': ' + ', '.join(outcomes) if outcomes else ''}",
+        "no outcome or roster-status column is a model feature",
+        not outcomes and not roster_status,
+        f"{n_features} features, {len(outcomes)} outcome columns, {len(roster_status)} roster-status columns"
+        f"{': ' + ', '.join(outcomes + roster_status) if outcomes or roster_status else ''}",
+    )
+
+
+def check_rookie_cohort(panel: pl.DataFrame) -> bool:
+    """A missing prior season must not be used as a synonym for rookie."""
+    expected = (
+        pl.when(pl.col("years_exp").is_not_null())
+        .then(pl.col("years_exp") == 0)
+        .otherwise(pl.col("draft_year") == pl.col("season"))
+        .fill_null(False)
+    )
+    mismatches = panel.filter(pl.col("is_rookie") != expected).height
+    rookies_with_history = panel.filter(pl.col("is_rookie") & pl.col("has_history")).height
+    returning = panel.filter(
+        (pl.col("season") > panel["season"].min())
+        & ~pl.col("has_history")
+        & ~pl.col("is_rookie")
+    ).height
+    return check(
+        "rookie cohort is explicit, not missing-history",
+        mismatches == 0 and rookies_with_history == 0 and returning > 0,
+        f"{panel.filter(pl.col('is_rookie')).height} rookies, {mismatches} flag mismatches, "
+        f"{returning} returning/no-prior players kept separate",
+    )
+
+
+def check_market_is_opt_in(panel: pl.DataFrame) -> bool:
+    """The football-only design must not silently consume panel ECR columns."""
+    train = panel.filter(pl.col("season") < panel["season"].max())
+    football = GBMProjector(snapshot=_SNAPSHOT if _SNAPSHOT is not None else snapshot_features())
+    football._design.fit(football._design_frame(train))
+    market = GBMProjector(
+        snapshot=_SNAPSHOT if _SNAPSHOT is not None else snapshot_features(),
+        include_market=True,
+    )
+    market._design.fit(market._design_frame(train))
+    leaked = [c for c in MARKET_COLS if c in football._design.columns]
+    return check(
+        "market consensus is an explicit model opt-in",
+        not leaked and "market_ecr" in market._design.columns,
+        f"football market columns {leaked}; market model has ECR: "
+        f"{'market_ecr' in market._design.columns}",
+    )
+
+
+def check_game_design_is_draft_day_legal(panel: pl.DataFrame) -> bool:
+    """Stage 2's per-game design must never see in-season opponent form or a
+    specific game's Vegas line.
+
+    This is the invariant the whole per-game mechanism rests on: every week
+    of a projected season reads `prev_season_opp_*` only (the defense's
+    *completed* prior year), never the rolling in-season form or a market
+    line, both of which are illegal for any week beyond the first on an
+    unplayed season. `_expand_to_games` is supposed to strip these before the
+    design ever sees them -- this asserts it actually does.
+    """
+    game_model = _fit_game_design(panel)
+    illegal = [
+        c
+        for c in game_model._game_design.columns
+        if (c.startswith("opp_") and c.endswith(("_last3", "_last5", "_last8")))
+        or c in ("spread_line", "total_line", "team_implied_total", "opponent_implied_total", "div_game")
+    ]
+    return check(
+        "per-game design carries no rolling opponent form or per-game Vegas line",
+        not illegal,
+        f"{len(game_model._game_design.columns)} features, {len(illegal)} illegal"
+        f"{': ' + ', '.join(illegal) if illegal else ''}",
     )
 
 
@@ -311,6 +419,9 @@ def main() -> int:
         check_ladder_ordering(metrics),
         check_prediction_ranges(predictions),
         check_no_outcome_features(panel),
+        check_rookie_cohort(panel),
+        check_market_is_opt_in(panel),
+        check_game_design_is_draft_day_legal(panel),
         check_model_beats_rung1(metrics),
         check_preseason_panel(panel),
     ]

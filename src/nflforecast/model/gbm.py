@@ -55,7 +55,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import polars as pl
 
-from nflforecast.config import get_logger
+from nflforecast.config import PROCESSED_DIR, get_logger
 from nflforecast.model.benchmarks import (
     QUANTILES,
     _finish,
@@ -68,6 +68,13 @@ from nflforecast.model.panel import PRIOR_LAGS, snapshot_features
 
 logger = get_logger("gbm")
 
+# Byproducts of `features/build_feature_table.py` -- see its module docstring.
+# Read directly here rather than through a `features` import so `model/`
+# keeps its existing rule of only ever touching `PROCESSED_DIR`.
+FIXTURES_PATH = PROCESSED_DIR / "season_fixtures.parquet"
+OPPONENT_PROFILE_PATH = PROCESSED_DIR / "opponent_season_profile.parquet"
+WEEKLY_LABELS_PATH = PROCESSED_DIR / "player_week_labels.parquet"
+
 # Marcel's weights, reused here to *engineer* priors rather than to project.
 # A GBDT will not invent "weight the last three seasons 5/4/3 and divide by
 # games" from three pairs of raw columns, and resources.md §4's list of things
@@ -78,8 +85,23 @@ _PRIOR_WEIGHTS = (5.0, 4.0, 3.0)
 # week of game 1, which is after drafts happen. See the module docstring.
 POST_DRAFT_COLS = ("injury_report_status", "injury_practice_status", "depth_chart_rank")
 
-# Never features: identifiers and free text.
-_DROP = ("player_id", "season", "player_name", "opponent", "head_coach", "play_caller")
+# The panel carries these so the ECR benchmark can use the same rows as every
+# other projector. They are not football features: a GBM must opt in or the
+# nominally football-only model silently becomes market-informed.
+MARKET_COLS = ("market_ecr", "market_ecr_sd", "market_snapshot_date", "market_cutoff_date")
+
+# Never features: identifiers, free text, and roster status. The latter is
+# retained upstream to define the active-roster spine, but is deliberately
+# excluded from the availability model.
+_DROP = (
+    "player_id",
+    "season",
+    "player_name",
+    "opponent",
+    "head_coach",
+    "play_caller",
+    "roster_status",
+)
 
 # The panel carries its labels in the same frame as its features -- every
 # `actual_*` column is an outcome of the season being projected. Excluding
@@ -100,10 +122,31 @@ _CATEGORICAL = (
     "position",
     "team",
     "roof",
-    "roster_status",
     "injury_report_status",
     "injury_practice_status",
 )
+
+# The per-game design (stage 2 only, see `GBMProjector._expand_to_games`):
+# `opponent` is dropped from the season design above because a week-1
+# opponent says nothing about the other 16 games, but it is exactly the
+# feature a per-game design exists to use -- 32 levels over thousands of
+# player-game rows, nothing like `head_coach`'s memorisation risk.
+_GAME_CATEGORICAL = _CATEGORICAL + ("opponent",)
+# `targets`/`carries` are here because `fit` joins the real weekly outcome
+# onto the training frame before fitting the design -- the same column names
+# as the stage's own labels, and without this they would be the best
+# predictor of themselves. Mirrors `_DROP_PREFIXES` protecting the season
+# design from `actual_*`.
+_GAME_DROP = tuple(c for c in _DROP if c != "opponent") + ("targets", "carries")
+
+# Week-1-snapshot columns that describe *that specific game* rather than the
+# player or team all season, and so must not be reused unchanged for a
+# different opponent every other week: the Vegas market (a future week's
+# line does not exist in May) and whether week 1 happened to be divisional.
+# `opponent`, `prev_season_opp_*`, and the rolling `opp_*_last{3,5,8}` form
+# are handled separately in `_expand_to_games` since they are name-patterned
+# rather than a fixed list.
+_GAME_SPECIFIC_COLS = ("spread_line", "total_line", "team_implied_total", "opponent_implied_total", "div_game")
 
 # Shrinkage grids, in "league-average observations the prior is worth". A
 # target is worth ~1.3 PPR points and a carry ~0.55, so efficiency needs a lot
@@ -161,19 +204,26 @@ class _Design:
     # answer "how much of this model is one column?" without editing module
     # constants and forgetting to put them back.
     drop: tuple[str, ...] = ()
+    # Which columns are treated as categorical, and which are always dropped
+    # regardless of `drop` above. Default to the season-grain constants; the
+    # per-game design overrides both to let `opponent` in -- see
+    # `GBMProjector._expand_to_games`.
+    categorical_cols: tuple[str, ...] = _CATEGORICAL
+    always_drop: tuple[str, ...] = _DROP
 
     @property
     def columns(self) -> list[str]:
         return self.numeric + self.categorical
 
     def fit(self, df: pl.DataFrame) -> "_Design":
-        keep = lambda c: _usable(c) and c not in self.drop  # noqa: E731
+        usable = lambda c: c not in self.always_drop and not c.startswith(_DROP_PREFIXES)  # noqa: E731
+        keep = lambda c: usable(c) and c not in self.drop  # noqa: E731
         self.numeric = [
             c
             for c, dt in zip(df.columns, df.dtypes)
-            if keep(c) and c not in _CATEGORICAL and (dt.is_numeric() or dt == pl.Boolean)
+            if keep(c) and c not in self.categorical_cols and (dt.is_numeric() or dt == pl.Boolean)
         ]
-        self.categorical = [c for c in _CATEGORICAL if c in df.columns and keep(c)]
+        self.categorical = [c for c in self.categorical_cols if c in df.columns and keep(c)]
         self.codes = {
             c: {v: i for i, v in enumerate(sorted(df[c].drop_nulls().unique().to_list()))}
             for c in self.categorical
@@ -193,6 +243,21 @@ class _Design:
         return list(range(len(self.numeric), len(self.columns)))
 
 
+def _load_fixtures() -> pl.DataFrame:
+    """(team, season, week, opponent) for every REG game -- see build_feature_table.py."""
+    return pl.read_parquet(FIXTURES_PATH)
+
+
+def _load_opponent_profile() -> pl.DataFrame:
+    """(opponent, season) -> prev_season_opp_* -- see build_feature_table.py."""
+    return pl.read_parquet(OPPONENT_PROFILE_PATH)
+
+
+def _load_weekly_labels() -> pl.DataFrame:
+    """Real per-game outcomes, for stage 2's per-game training rows."""
+    return pl.read_parquet(WEEKLY_LABELS_PATH)
+
+
 class GBMProjector:
     """resources.md §4's three stages, fitted per fold. A `Projector`.
 
@@ -205,18 +270,34 @@ class GBMProjector:
         self,
         name: str = "gbm",
         snapshot: pl.DataFrame | None = None,
+        fixtures: pl.DataFrame | None = None,
+        opponent_profile: pl.DataFrame | None = None,
+        weekly_labels: pl.DataFrame | None = None,
         params: dict | None = None,
         include_post_draft: bool = False,
+        include_market: bool = False,
         blend_with_marcel: float = 0.0,
         drop_features: tuple[str, ...] = (),
     ) -> None:
         self.name = name
         self.params = {**BASE_PARAMS, **(params or {})}
         self.include_post_draft = include_post_draft
+        self.include_market = include_market
         self.drop_features = drop_features
         self.blend_with_marcel = blend_with_marcel
         self._snapshot = snapshot_features() if snapshot is None else snapshot
+        # Both pure "known before any game of the target season" facts (a
+        # public schedule; a defense's *completed prior* year, via the same
+        # season+1 shift `panel.py`'s own prior joins rely on) -- read once
+        # and reused across every fold, same as `self._snapshot`. See
+        # `_expand_to_games`.
+        self._fixtures = _load_fixtures() if fixtures is None else fixtures
+        self._opponent_profile = _load_opponent_profile() if opponent_profile is None else opponent_profile
+        self._weekly_labels = _load_weekly_labels() if weekly_labels is None else weekly_labels
         self._design = _Design(drop=tuple(drop_features))
+        self._game_design = _Design(
+            drop=tuple(drop_features), categorical_cols=_GAME_CATEGORICAL, always_drop=_GAME_DROP
+        )
         self._boosters: dict[str, object] = {}
         self._rounds: dict[str, int] = {}
         self._mu_ppt: dict[str, float] = {}
@@ -237,14 +318,18 @@ class GBMProjector:
         which LightGBM handles natively. Dropping it instead would silently
         change the scored universe between the ladder and the model.
         """
-        wide = self._snapshot.drop(
-            [c for c in ("team", "position", "age_years", "years_exp", "draft_round",
-                         "draft_pick", "is_undrafted") if c in self._snapshot.columns]
+        duplicated = (
+            "team", "position", "age_years", "years_exp", "draft_year",
+            "draft_round", "draft_pick", "is_undrafted", *MARKET_COLS,
         )
+        wide = self._snapshot.drop([c for c in duplicated if c in self._snapshot.columns])
         if not self.include_post_draft:
             wide = wide.drop([c for c in POST_DRAFT_COLS if c in wide.columns])
 
-        df = panel.join(wide, on=["player_id", "season"], how="left").with_columns(
+        df = panel.join(wide, on=["player_id", "season"], how="left")
+        if not self.include_market:
+            df = df.drop([c for c in MARKET_COLS if c in df.columns])
+        df = df.with_columns(
             _engineered_priors()
         )
         if "depth_chart_rank" in df.columns:
@@ -253,6 +338,38 @@ class GBMProjector:
             # which is worse than 3rd rather than a fourth unordered level.
             df = df.with_columns(pl.col("depth_chart_rank").cast(pl.Float64, strict=False))
         return df
+
+    def _expand_to_games(self, panel: pl.DataFrame) -> pl.DataFrame:
+        """One row per player-season per *scheduled game*, matchup-aware.
+
+        The whole mechanism this class exists to add: a season projection is
+        no longer one flat rate, it is a sum over the real 17-ish games on
+        the schedule, each carrying its own opponent's prior-season profile.
+        Used for both `fit` (joined to the real weekly labels below) and
+        `predict` (fed straight to the stage-2 boosters) -- the *same*
+        transform either way, so there is no train/serve skew to reason
+        about: a training row and a serving row are built identically.
+
+        Starts from the season-grain design frame (today's week-1 snapshot +
+        engineered priors) and strips everything that describes *week 1's
+        specific game* rather than the player or team all season -- its own
+        `opponent`, that opponent's `prev_season_opp_*`, the in-season
+        rolling opponent form (never legal beyond week 1 anyway), and the
+        Vegas lines (a future week's line does not exist in May) -- then fans
+        each row out over the real schedule and reattaches the *correct*
+        opponent and `prev_season_opp_*` for every week on it.
+        """
+        static = self._design_frame(panel)
+        strip = [
+            c
+            for c in static.columns
+            if c == "opponent"
+            or c.startswith("prev_season_opp_")
+            or (c.startswith("opp_") and c.endswith(("_last3", "_last5", "_last8")))
+            or c in _GAME_SPECIFIC_COLS
+        ]
+        games = static.drop(strip).join(self._fixtures, on=["team", "season"], how="inner")
+        return games.join(self._opponent_profile, on=["opponent", "season"], how="left")
 
     # -- fitting -------------------------------------------------------
 
@@ -267,24 +384,33 @@ class GBMProjector:
         # exists to predict, so dropping it would remove the negative class.
         self._fit_stage("games", x, frame["actual_games"].cast(pl.Float64).to_numpy(), seasons)
 
-        # Stage 2: opportunity, per game, on rows that produced a per-game
-        # rate at all, weighted by the games behind it. Unweighted, a
-        # two-game season with one big afternoon counts as much as a full
-        # year -- `docs/modeling.md` flags exactly that as the first thing to
-        # revisit about the benchmark's fitted constants.
-        played = frame.filter(pl.col("actual_games") > 0)
-        xp = self._design.matrix(played)
-        played_seasons = played["season"].to_numpy()
-        weight = played["actual_games"].cast(pl.Float64).to_numpy()
-        for stage, col in (("tgt_pg", "actual_targets"), ("car_pg", "actual_carries")):
-            y = (played[col] / played["actual_games"]).cast(pl.Float64).to_numpy()
+        # Stage 2: opportunity, per *game* and matchup-aware -- real games
+        # only, one row each, no per-season averaging. Each row already is
+        # one game, so unlike stage 1's season total there is nothing to
+        # weight by games played: a two-game season contributes two rows,
+        # exactly its share, which also retires the "unweighted per-game
+        # RMSE" caveat `docs/modeling.md` used to flag about this stage's
+        # fit. `_expand_to_games` is what makes the row-per-game a real
+        # matchup rather than a repeated season average -- see its
+        # docstring.
+        weekly_y = self._weekly_labels.filter(pl.col("played")).select(
+            "player_id", "season", "week", "targets", "carries"
+        )
+        game_frame = self._expand_to_games(train).join(
+            weekly_y, on=["player_id", "season", "week"], how="inner"
+        )
+        self._game_design.fit(game_frame)
+        xg = self._game_design.matrix(game_frame)
+        game_seasons = game_frame["season"].to_numpy()
+        for stage, col in (("tgt_pg", "targets"), ("car_pg", "carries")):
+            y = game_frame[col].cast(pl.Float64).to_numpy()
             self._fit_stage(
                 stage,
-                xp,
+                xg,
                 y,
-                played_seasons,
-                weight=weight,
-                monotone=_monotone_for(stage, self._design),
+                game_seasons,
+                monotone=_monotone_for(stage, self._game_design),
+                design=self._game_design,
             )
 
         # Stage 3: efficiency, not learned.
@@ -317,6 +443,7 @@ class GBMProjector:
         weight: np.ndarray | None = None,
         monotone: list[int] | None = None,
         params: dict | None = None,
+        design: "_Design | None" = None,
     ) -> None:
         """Early-stop on the last training season, then refit on all of it.
 
@@ -327,9 +454,16 @@ class GBMProjector:
         afterwards is the standard trade -- the stopping point is chosen out of
         sample, and the final model still gets the most recent season, which
         is the one most like the season being projected.
+
+        `design` is whichever `_Design` built `x`'s columns -- the season
+        design for every stage but stage 2, which is fit through the
+        matchup-aware `_game_design` instead. LightGBM addresses features by
+        position, so passing the wrong one here would silently mislabel every
+        column without erroring.
         """
         import lightgbm as lgb
 
+        design = design or self._design
         cfg = {**self.params, **(params or {})}
         if monotone:
             cfg["monotone_constraints"] = monotone
@@ -337,15 +471,15 @@ class GBMProjector:
         # Re-tuned every fold rather than cached on the instance: the harness
         # reuses one projector across folds, so a cached round count would let
         # fold 2020 set the budget for fold 2024 on a third of the history.
-        rounds = self._tune_rounds(cfg, x, y, seasons, weight)
+        rounds = self._tune_rounds(cfg, x, y, seasons, weight, design)
         self._rounds[stage] = rounds
 
         dataset = lgb.Dataset(
             x,
             label=y,
             weight=weight,
-            feature_name=self._design.columns,
-            categorical_feature=self._design.categorical_indices,
+            feature_name=design.columns,
+            categorical_feature=design.categorical_indices,
             free_raw_data=False,
         )
         self._boosters[stage] = lgb.train(cfg, dataset, num_boost_round=rounds)
@@ -357,6 +491,7 @@ class GBMProjector:
         y: np.ndarray,
         seasons: np.ndarray,
         weight: np.ndarray | None,
+        design: "_Design",
     ) -> int:
         """Number of boosting rounds, chosen on a held-out final season."""
         import lightgbm as lgb
@@ -371,8 +506,8 @@ class GBMProjector:
                 x[rows],
                 label=y[rows],
                 weight=None if weight is None else weight[rows],
-                feature_name=self._design.columns,
-                categorical_feature=self._design.categorical_indices,
+                feature_name=design.columns,
+                categorical_feature=design.categorical_indices,
                 reference=reference,
                 free_raw_data=False,
             )
@@ -435,23 +570,89 @@ class GBMProjector:
         x = self._design.matrix(frame)
 
         games = np.clip(self._boosters["games"].predict(x), 0.0, 17.0)
-        tgt_pg = np.clip(self._boosters["tgt_pg"].predict(x), 0.0, None)
-        car_pg = np.clip(self._boosters["car_pg"].predict(x), 0.0, None)
 
-        efficiency = frame.select(
+        # Stage 2: one prediction per scheduled game, matchup-aware -- the
+        # mechanism this class exists for. `_expand_to_games` fans each
+        # player-season out over its real schedule; efficiency stays
+        # season-level and broadcasts across every game (it is deliberately
+        # not matchup-aware -- see the module docstring). Summing the
+        # per-game points and dividing back down by the games this stage
+        # predicts turns the sum into a flat per-game rate, `pred_ppg`, which
+        # is what keeps everything below -- the Marcel blend, `_finish`'s
+        # pred_points = pred_ppg x pred_games identity -- unchanged from the
+        # season-direct version this replaces.
+        game_frame = self._expand_to_games(target)
+        xg = self._game_design.matrix(game_frame)
+        tgt_pg = np.clip(self._boosters["tgt_pg"].predict(xg), 0.0, None)
+        car_pg = np.clip(self._boosters["car_pg"].predict(xg), 0.0, None)
+        game_eff = game_frame.select(
             _efficiency_expr("ppt", _mu_expr(self._mu_ppt, self._fallback_ppt), self._k_ppt).alias("ppt"),
             _efficiency_expr("ppc", _mu_expr(self._mu_ppc, self._fallback_ppc), self._k_ppc).alias("ppc"),
         )
-        ppg = tgt_pg * efficiency["ppt"].to_numpy() + car_pg * efficiency["ppc"].to_numpy()
+        game_points = tgt_pg * game_eff["ppt"].to_numpy() + car_pg * game_eff["ppc"].to_numpy()
 
-        out = target.select("player_id", "season", "position").with_columns(
-            pl.Series("pred_ppg", ppg),
-            pl.Series("pred_games", games),
-            pl.Series("pred_tgt_per_game", tgt_pg),
-            pl.Series("pred_car_per_game", car_pg),
-            pl.Series("pred_pts_per_target", efficiency["ppt"]),
-            pl.Series("pred_pts_per_carry", efficiency["ppc"]),
+        per_game = game_frame.select("player_id", "season").with_columns(
+            pl.Series("tgt_pg", tgt_pg),
+            pl.Series("car_pg", car_pg),
+            pl.Series("game_points", game_points),
         )
+        # `points_at_full_attendance`: the games stage is what accounts for
+        # missed time, applied as a uniform share of the schedule rather than
+        # picking which specific games are missed -- modelling *which* week a
+        # player gets hurt is out of scope (resources.md §4's availability
+        # stage is a season total, not a week-by-week hazard).
+        season_summary = per_game.group_by(["player_id", "season"]).agg(
+            pl.col("game_points").sum().alias("points_at_full_attendance"),
+            pl.len().alias("n_scheduled"),
+            pl.col("tgt_pg").mean().alias("pred_tgt_per_game"),
+            pl.col("car_pg").mean().alias("pred_car_per_game"),
+        )
+
+        joined = (
+            frame.select("player_id", "season", "position")
+            .with_columns(pl.Series("pred_games", games))
+            .join(season_summary, on=["player_id", "season"], how="left")
+            .with_columns(
+                # A team missing from the fixtures table should not happen
+                # for a real season (`n_scheduled` would be null) -- fall
+                # back to zero rather than crash, the same "unknown stays
+                # unknown" posture nulls get everywhere else in this module.
+                pl.col("points_at_full_attendance").fill_null(0.0),
+                pl.col("n_scheduled").fill_null(1),
+                pl.col("pred_tgt_per_game").fill_null(0.0),
+                pl.col("pred_car_per_game").fill_null(0.0),
+            )
+            .with_columns(
+                (
+                    pl.col("points_at_full_attendance") * pl.col("pred_games") / pl.col("n_scheduled")
+                ).alias("season_points")
+            )
+            .with_columns(
+                pl.when(pl.col("pred_games") > 0)
+                .then(pl.col("season_points") / pl.col("pred_games"))
+                .otherwise(0.0)
+                .alias("pred_ppg")
+            )
+        )
+
+        # Joined by key, not by position: `joined` went through an extra
+        # `season_summary` join above that `frame` never did, so its row
+        # order is no longer guaranteed to match `frame`'s the way the rest
+        # of this method assumes elsewhere.
+        efficiency = frame.select(
+            "player_id", "season",
+            _efficiency_expr("ppt", _mu_expr(self._mu_ppt, self._fallback_ppt), self._k_ppt).alias(
+                "pred_pts_per_target"
+            ),
+            _efficiency_expr("ppc", _mu_expr(self._mu_ppc, self._fallback_ppc), self._k_ppc).alias(
+                "pred_pts_per_carry"
+            ),
+        )
+
+        out = joined.select(
+            "player_id", "season", "position", "pred_ppg", "pred_games",
+            "pred_tgt_per_game", "pred_car_per_game",
+        ).join(efficiency, on=["player_id", "season"], how="left")
 
         if self._marcel is not None:
             w = self.blend_with_marcel
@@ -482,16 +683,48 @@ class GBMProjector:
 
     def importances(self, stage: str = "tgt_pg", top: int = 20) -> pl.DataFrame:
         booster = self._boosters[stage]
+        # tgt_pg/car_pg are fit through the matchup-aware `_game_design`,
+        # which has a different column layout (and includes `opponent`) than
+        # every other stage's `_design` -- see `_fit_stage`'s `design` param.
+        design = self._game_design if stage in ("tgt_pg", "car_pg") else self._design
         return (
             pl.DataFrame(
                 {
-                    "feature": self._design.columns,
+                    "feature": design.columns,
                     "gain": booster.feature_importance("gain"),
                 }
             )
             .sort("gain", descending=True)
             .head(top)
         )
+
+
+class RookieGBMProjector(GBMProjector):
+    """The decomposed GBM fitted only on prior rookie classes.
+
+    Veteran rows can teach a general model how NFL history maps to next-year
+    production, but they vastly outnumber rookies and carry the very priors a
+    rookie does not have. This projector makes the intended comparison
+    explicit: draft capital and preseason context are learned from earlier
+    rookie outcomes, then applied to the next class.
+    """
+
+    def __init__(self, name: str = "rookie_gbm", **kwargs) -> None:
+        super().__init__(name=name, **kwargs)
+
+    def fit(self, train: pl.DataFrame) -> "RookieGBMProjector":
+        if "is_rookie" not in train.columns:
+            raise ValueError("rookie projector requires panel.is_rookie")
+        rookies = train.filter(pl.col("is_rookie"))
+        if rookies.height == 0:
+            raise ValueError("rookie projector has no prior rookie classes to fit")
+        super().fit(rookies)
+        return self
+
+    def predict(self, target: pl.DataFrame) -> pl.DataFrame:
+        if "is_rookie" not in target.columns:
+            raise ValueError("rookie projector requires panel.is_rookie")
+        return super().predict(target.filter(pl.col("is_rookie")))
 
 
 def gbm(**kwargs) -> GBMProjector:
@@ -511,11 +744,6 @@ def gbm_marcel_blend(weight: float = 0.35) -> GBMProjector:
 
 
 # -- helpers -----------------------------------------------------------
-
-
-def _usable(column: str) -> bool:
-    """True if a column is allowed into the design matrix at all."""
-    return column not in _DROP and not column.startswith(_DROP_PREFIXES)
 
 
 def _monotone_for(stage: str, design: _Design) -> list[int]:

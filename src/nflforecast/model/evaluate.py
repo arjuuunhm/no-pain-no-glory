@@ -45,21 +45,26 @@ def run_walk_forward(
     projectors: list[Projector] | None = None,
     min_train_seasons: int = 3,
     require_history: bool = True,
+    scoring_cohort: str | None = None,
+    common_coverage: bool = False,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Fit and score every projector on every fold. Returns (metrics, predictions).
 
-    `require_history` restricts scoring to players with a prior season. Rung 1
-    is undefined without one, so including rookies would score the benchmarks
-    on rows where they can only emit the positional mean -- flattering the
-    comparison in a way a real draft board would not. The excluded share is
-    logged per fold, because that share is the part of the draft the benchmark
-    ladder cannot speak to at all.
+    ``scoring_cohort`` is one of ``history`` (the default), ``rookies``, or
+    ``all``. ``require_history`` remains as a compatibility alias when no
+    explicit cohort is supplied. ``common_coverage`` intersects player-season
+    keys emitted by every projector within a fold; use it for a fair market
+    comparison because ECR does not rank every rostered rookie.
     """
     panel = build_panel() if panel is None else panel
     projectors = default_ladder() if projectors is None else projectors
 
-    universe = panel.filter(pl.col("has_history")) if require_history else panel
-    folds = walk_forward(universe["season"].unique().to_list(), min_train_seasons)
+    # Cohorts restrict only the test rows. All completed player-seasons remain
+    # legitimate training outcomes; rookie-specific projectors apply their own
+    # training filter, while general models can learn from the whole panel.
+    cohort = scoring_cohort or ("history" if require_history else "all")
+    scoring_universe = select_scoring_universe(panel, cohort)
+    folds = walk_forward(panel["season"].unique().to_list(), min_train_seasons)
     if not folds:
         raise ValueError(
             f"no folds with >= {min_train_seasons} training seasons in "
@@ -70,32 +75,79 @@ def run_walk_forward(
     prediction_frames: list[pl.DataFrame] = []
 
     for fold in folds:
-        train = universe.filter(pl.col("season").is_in(fold.train_seasons))
-        test = universe.filter(pl.col("season") == fold.test_season)
-        excluded = panel.filter(
-            (pl.col("season") == fold.test_season) & ~pl.col("has_history")
-        ).height
+        train = panel.filter(pl.col("season").is_in(fold.train_seasons))
+        test = scoring_universe.filter(pl.col("season") == fold.test_season)
+        full_test = panel.filter(pl.col("season") == fold.test_season)
+        excluded = full_test.height - test.height
         logger.info(
-            "%s | train %s, test %s (+%s rookies not scored)",
+            "%s | train %s, test %s in %s cohort (%s outside cohort)",
             fold,
             train.height,
             test.height,
+            cohort,
             excluded,
         )
 
+        fold_predictions: list[pl.DataFrame] = []
+        missing_common_projector = False
         for projector in projectors:
             pred = projector.fit(train).predict(test)
+            if pred.height == 0:
+                logger.info("%s | no eligible rows in %s; skipped", fold, projector.name)
+                missing_common_projector = missing_common_projector or common_coverage
+                continue
+            metadata = [
+                c
+                for c in (
+                    "actual_points", "actual_ppg", "actual_games", "is_rookie",
+                    "has_history", "market_ecr",
+                )
+                if c in test.columns and c not in pred.columns
+            ]
             scored = pred.join(
-                test.select(
-                    "player_id", "season", "actual_points", "actual_ppg", "actual_games"
-                ),
+                test.select("player_id", "season", *metadata),
                 on=["player_id", "season"],
             ).with_columns(pl.lit(projector.name).alias("projector"))
+            fold_predictions.append(scored)
 
-            metric_rows.extend(_score_fold(scored, projector.name, fold))
+        if common_coverage and missing_common_projector:
+            logger.info("%s | no common coverage across every projector; fold skipped", fold)
+            continue
+        if common_coverage and fold_predictions:
+            keys = fold_predictions[0].select("player_id", "season")
+            for frame in fold_predictions[1:]:
+                keys = keys.join(
+                    frame.select("player_id", "season"),
+                    on=["player_id", "season"],
+                    how="inner",
+                )
+            fold_predictions = [
+                frame.join(keys, on=["player_id", "season"], how="inner")
+                for frame in fold_predictions
+            ]
+            logger.info("%s | common projector coverage: %s players", fold, keys.height)
+
+        for scored in fold_predictions:
+            if scored.height == 0:
+                continue
+            name = scored["projector"][0]
+            metric_rows.extend(_score_fold(scored, name, fold))
             prediction_frames.append(scored)
 
     return pl.DataFrame(metric_rows), pl.concat(prediction_frames, how="diagonal")
+
+
+def select_scoring_universe(panel: pl.DataFrame, cohort: str) -> pl.DataFrame:
+    """Select a declared evaluation cohort without changing training rows."""
+    if cohort == "history":
+        return panel.filter(pl.col("has_history"))
+    if cohort == "rookies":
+        if "is_rookie" not in panel.columns:
+            raise ValueError("rookie scoring requires panel.is_rookie")
+        return panel.filter(pl.col("is_rookie"))
+    if cohort == "all":
+        return panel
+    raise ValueError(f"unknown scoring cohort {cohort!r}; expected history, rookies, or all")
 
 
 def _score_fold(scored: pl.DataFrame, name: str, fold: Fold) -> list[dict]:

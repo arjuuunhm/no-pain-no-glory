@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nflforecast.features import build_feature_table
+from nflforecast.config import HISTORY_END_SEASON, HISTORY_START_SEASON, TARGET_SEASON
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--upcoming-season",
         type=int,
-        help="also build preseason rows for this unplayed season, e.g. 2026",
+        help=f"also build preseason rows for this unplayed season, e.g. {TARGET_SEASON}",
     )
     return p.parse_args()
 
@@ -41,6 +42,8 @@ def main() -> int:
     features, weekly_labels, season_labels = build_feature_table(
         upcoming_season=args.upcoming_season
     )
+    assert features["season"].min() == HISTORY_START_SEASON
+    assert features["season"].max() == HISTORY_END_SEASON
     print(f"player_week_features: {features.height} rows x {features.width} cols")
     print(f"player_week_labels:   {weekly_labels.height} rows x {weekly_labels.width} cols")
     print(f"player_season_labels: {season_labels.height} rows x {season_labels.width} cols")

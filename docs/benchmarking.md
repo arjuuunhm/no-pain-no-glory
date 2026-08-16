@@ -78,8 +78,8 @@ you what the model *used*, never whether it helped.
 
 ## Measuring a change
 
-The three flags on `train_model.py` (`--with-post-draft`, `--blend-weight`,
-`--include-rookies`) cover their own experiments. Everything else — ablating a
+The four flags on `train_model.py` (`--with-post-draft`, `--blend-weight`,
+`--rookies`, `--with-market`) cover their own experiments. Everything else — ablating a
 feature block, toggling a stage — goes through `GBMProjector`'s constructor,
 which exists so you can answer "how much of this model is one column?" without
 editing module constants and forgetting to put them back.

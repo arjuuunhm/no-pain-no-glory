@@ -19,11 +19,10 @@ path with "all seasons" as the training set is what keeps the two honest.
 What this cannot tell you is how good the projection is. Read
 docs/modeling.md for that, and note two caveats it records:
 
-- Before the late-August cut deadline, `roster_status` is ~99% ACT and carries
-  almost none of the availability signal it carries in the backtest. Rebuild
-  and re-run after cuts.
-- There is no ADP benchmark yet (resources.md §5 rung 3), so nothing here
-  establishes an edge over the market -- only over Marcel.
+- `roster_status` is used only to define the active-roster spine; it is not a
+  feature of the learned projection.
+- `--with-market` uses the archived FantasyPros ECR feature; it is a
+  market-informed projection, not evidence of an edge over the market.
 """
 
 from __future__ import annotations
@@ -37,7 +36,9 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from nflforecast.config import PROCESSED_DIR, SKILL_POSITIONS, get_logger
-from nflforecast.model.gbm import GBMProjector
+from nflforecast.model.benchmarks import ConsensusECR
+from nflforecast.model.gbm import GBMProjector, RookieGBMProjector
+from nflforecast.model.market import attach_preseason_ecr
 from nflforecast.model.panel import (
     PRESEASON_FEATURES_PATH,
     build_panel,
@@ -59,6 +60,11 @@ def parse_args() -> argparse.Namespace:
         "--with-post-draft",
         action="store_true",
         help="include week-1 injury/depth columns (absent for an unplayed season; see docs)",
+    )
+    p.add_argument(
+        "--with-market",
+        action="store_true",
+        help="include the archived FantasyPros ECR feature in a separate market-informed projection",
     )
     return p.parse_args()
 
@@ -84,17 +90,83 @@ def main() -> int:
     # being projected. They are the same 161 columns built by the same blocks;
     # only the spine underneath them differs.
     snapshot = pl.concat(
-        [snapshot_features(), pl.read_parquet(PRESEASON_FEATURES_PATH).drop("week")],
+        [snapshot_features(include_market=args.with_market), pl.read_parquet(PRESEASON_FEATURES_PATH).drop("week")],
         how="diagonal_relaxed",
     )
+    if args.with_market:
+        market_cols = (
+            "market_ecr",
+            "market_ecr_sd",
+            "market_snapshot_date",
+            "market_cutoff_date",
+        )
+        snapshot = attach_preseason_ecr(snapshot.drop([c for c in market_cols if c in snapshot.columns]))
 
-    model = GBMProjector(snapshot=snapshot, include_post_draft=args.with_post_draft)
-    board = model.fit(train).predict(target)
+    model = GBMProjector(
+        name="gbm_market" if args.with_market else "gbm",
+        snapshot=snapshot,
+        include_post_draft=args.with_post_draft,
+        include_market=args.with_market,
+    )
+    board = model.fit(train).predict(target).with_columns(
+        pl.lit("gbm_market" if args.with_market else "gbm").alias("projection_source")
+    )
+    rookies = target.filter(pl.col("is_rookie"))
+    if rookies.height:
+        rookie_model = RookieGBMProjector(
+            name="rookie_gbm_market" if args.with_market else "rookie_gbm",
+            snapshot=snapshot,
+            include_post_draft=args.with_post_draft,
+            include_market=args.with_market,
+        )
+        rookie_board = rookie_model.fit(train).predict(rookies).with_columns(
+            pl.lit("rookie_gbm_market" if args.with_market else "rookie_gbm").alias(
+                "projection_source"
+            )
+        )
+        if args.with_market:
+            # Walk-forward results show calibrated ECR beating both rookie
+            # GBMs in every measured fold. Use it where available and retain
+            # the football model for prospects the market source does not rank.
+            rookie_ecr = ConsensusECR(rookies_only=True).fit(train).predict(rookies)
+            if rookie_ecr.height:
+                rookie_board = pl.concat(
+                    [
+                        rookie_board.join(
+                            rookie_ecr.select("player_id", "season"),
+                            on=["player_id", "season"],
+                            how="anti",
+                        ),
+                        rookie_ecr.with_columns(
+                            pl.lit("rookie_ecr").alias("projection_source")
+                        ),
+                    ],
+                    how="diagonal_relaxed",
+                )
+        board = pl.concat(
+            [
+                board.join(
+                    rookies.select("player_id", "season"),
+                    on=["player_id", "season"],
+                    how="anti",
+                ),
+                rookie_board,
+            ],
+            how="diagonal_relaxed",
+        )
+        logger.info(
+            "used rookie projections for %s rookies (%s ECR-covered)",
+            rookies.height,
+            rookie_board.filter(pl.col("projection_source") == "rookie_ecr").height,
+        )
 
     board = (
         board.join(
             target.select(
-                ["player_id", "player_name", "team", "age_years", "years_exp", "has_history"]
+                [
+                    "player_id", "player_name", "team", "age_years", "years_exp",
+                    "has_history", "is_rookie", "market_ecr",
+                ]
             ),
             on="player_id",
             how="left",
@@ -120,6 +192,7 @@ def main() -> int:
                 "position",
                 pl.col("age_years").alias("age"),
                 pl.col("pred_points").alias("pts"),
+                pl.col("market_ecr").alias("ecr"),
                 pl.col("pred_games").alias("gms"),
                 pl.col("pred_ppg").alias("ppg"),
                 pl.col("pred_points_q10").alias("q10"),

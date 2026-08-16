@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+import numpy as np
 import polars as pl
 
 from nflforecast.model.panel import PRIOR_LAGS
@@ -102,7 +103,9 @@ class PositionalMean:
 
     name = "positional_mean"
 
-    def __init__(self) -> None:
+    def __init__(self, *, rookies_only: bool = False) -> None:
+        self.rookies_only = rookies_only
+        self.name = "rookie_positional_mean" if rookies_only else "positional_mean"
         self._mu_ppg: dict[str, float] = {}
         self._mu_games: dict[str, float] = {}
         self._fallback_ppg = 0.0
@@ -110,12 +113,16 @@ class PositionalMean:
         self._resid_q: dict[float, float] = {}
 
     def fit(self, train: pl.DataFrame) -> "PositionalMean":
+        if self.rookies_only:
+            train = train.filter(pl.col("is_rookie"))
         self._mu_ppg, self._fallback_ppg = _positional_ppg(train)
         self._mu_games, self._fallback_games = _positional_games(train)
         self._resid_q = _residual_quantiles(self.predict(train), train)
         return self
 
     def predict(self, target: pl.DataFrame) -> pl.DataFrame:
+        if self.rookies_only:
+            target = target.filter(pl.col("is_rookie"))
         out = target.select(
             "player_id",
             "season",
@@ -325,8 +332,85 @@ def marcel() -> WeightedPrior:
     return WeightedPrior("marcel", weights=(5.0, 4.0, 3.0), age_adjust=True)
 
 
-def default_ladder() -> list[Projector]:
-    return [PositionalMean(), last_season_regressed(), marcel()]
+class ConsensusECR:
+    """Rung 3: FantasyPros ECR, calibrated to each training fold's labels.
+
+    ECR is a rank, so it has no native points, games, or per-game scale.  A
+    separate per-position linear mapping from ``log1p(ECR)`` to each stage is
+    fitted only on the fold's training seasons.  The rank itself determines
+    the ordering; the mapping only makes its magnitude comparable with the
+    rest of this decomposition-based harness.
+    """
+
+    name = "consensus_ecr"
+
+    def __init__(self, *, rookies_only: bool = False) -> None:
+        self.rookies_only = rookies_only
+        self.name = "rookie_ecr" if rookies_only else "consensus_ecr"
+        self._fits: dict[tuple[str, str], tuple[float, float]] = {}
+        self._fallback: dict[str, float] = {}
+        self._resid_q: dict[float, float] = {}
+        self._has_training_market = False
+
+    def fit(self, train: pl.DataFrame) -> "ConsensusECR":
+        if self.rookies_only:
+            train = train.filter(pl.col("is_rookie"))
+        available = train.filter(pl.col("market_ecr").is_not_null() & (pl.col("market_ecr") > 0))
+        self._has_training_market = available.height > 0
+        if not self._has_training_market:
+            return self
+        for target in ("actual_ppg", "actual_games"):
+            self._fallback[target] = float(available[target].mean() or 0.0)
+            for position in available["position"].unique().to_list():
+                rows = available.filter(pl.col("position") == position).drop_nulls(target)
+                if rows.height < 3:
+                    self._fits[(position, target)] = (0.0, self._fallback[target])
+                    continue
+                x = np.log1p(rows["market_ecr"].to_numpy())
+                y = rows[target].to_numpy()
+                slope, intercept = np.polyfit(x, y, 1)
+                self._fits[(position, target)] = (float(slope), float(intercept))
+        self._resid_q = _residual_quantiles(self.predict(available), available)
+        return self
+
+    def predict(self, target: pl.DataFrame) -> pl.DataFrame:
+        if self.rookies_only:
+            target = target.filter(pl.col("is_rookie"))
+        ranked = target.filter(pl.col("market_ecr").is_not_null() & (pl.col("market_ecr") > 0))
+        if not self._has_training_market:
+            return ranked.select("player_id", "season", "position").head(0).with_columns(
+                pl.lit(None, dtype=pl.Float64).alias("pred_ppg"),
+                pl.lit(None, dtype=pl.Float64).alias("pred_games"),
+                pl.lit(None, dtype=pl.Float64).alias("pred_points"),
+            )
+        # A positional mapping avoids pretending the 20th RB and 20th TE
+        # carry the same season-total expectation.
+        ppq = pl.lit(self._fallback.get("actual_ppg", 0.0))
+        games = pl.lit(self._fallback.get("actual_games", 0.0))
+        for position in ranked["position"].unique().to_list():
+            slope, intercept = self._fits.get(
+                (position, "actual_ppg"), (0.0, self._fallback.get("actual_ppg", 0.0))
+            )
+            ppq = pl.when(pl.col("position") == position).then(
+                intercept + slope * (pl.col("market_ecr") + 1.0).log()
+            ).otherwise(ppq)
+            slope, intercept = self._fits.get(
+                (position, "actual_games"), (0.0, self._fallback.get("actual_games", 0.0))
+            )
+            games = pl.when(pl.col("position") == position).then(
+                intercept + slope * (pl.col("market_ecr") + 1.0).log()
+            ).otherwise(games)
+        return _finish(
+            ranked.select("player_id", "season", "position", ppq.alias("pred_ppg"), games.alias("pred_games")),
+            self._resid_q,
+        )
+
+
+def default_ladder(*, include_market: bool = False) -> list[Projector]:
+    ladder: list[Projector] = [PositionalMean(), last_season_regressed(), marcel()]
+    if include_market:
+        ladder.append(ConsensusECR())
+    return ladder
 
 
 # -- shared helpers ----------------------------------------------------
